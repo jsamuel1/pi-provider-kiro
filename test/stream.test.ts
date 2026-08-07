@@ -3811,6 +3811,103 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   }, 30000);
 
+  it("does not inherit the failed attempt's cache counts when retrying", async () => {
+    // `usageEvent` is declared inside the retry loop, and the cache writes are
+    // post-loop, so an aborted attempt must contribute nothing to billing.
+    // cacheRead is priced as its own line in calculateCost, so inheriting a
+    // prior attempt's value would over-bill a turn that never read that cache.
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(async () => {
+      callCount++;
+      if (callCount === 1) {
+        return {
+          ok: true,
+          body: {
+            getReader: () => ({
+              read: vi
+                .fn()
+                .mockResolvedValueOnce({
+                  done: false,
+                  value: concatMessages(
+                    encodeEventMessage({
+                      tokenUsage: {
+                        uncachedInputTokens: 999,
+                        outputTokens: 111,
+                        totalTokens: 41110,
+                        cacheReadInputTokens: 40000,
+                        cacheWriteInputTokens: 7,
+                      },
+                    }),
+                    encodeEventMessage({ message: "throttled" }, "throttlingError"),
+                  ),
+                })
+                .mockResolvedValueOnce({ done: true, value: undefined }),
+              cancel: vi.fn().mockResolvedValue(undefined),
+              releaseLock: () => {},
+            }),
+          },
+        };
+      }
+      // Retry succeeds and reports NO metadataEvent at all.
+      return {
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: vi
+              .fn()
+              .mockResolvedValueOnce({
+                done: false,
+                value: encodeBody('{"content":"clean"}{"contextUsagePercentage":5}'),
+              })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            cancel: vi.fn().mockResolvedValue(undefined),
+            releaseLock: () => {},
+          }),
+        },
+      };
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg).toBeDefined();
+    if (!msg) throw new Error("Expected a completed assistant message");
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect((msg.content[0] as TextContent).text).toBe("clean");
+    // The abandoned attempt's counts must not appear anywhere in billing.
+    expect(msg.usage.cacheRead).toBe(0);
+    expect(msg.usage.cacheWrite).toBe(0);
+    expect(msg.usage.cost.cacheRead).toBe(0);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("falls back to summing components when a non-conforming frame omits totalTokens", async () => {
+    // TokenUsage.totalTokens is required on the wire, so this branch only guards
+    // a non-conforming server. The sum must match how the service itself defines
+    // the total: uncachedInput + cacheRead + cacheWrite + output.
+    const mockFetch = mockFetchChunked([
+      '{"content":"Hello"}',
+      '{"tokenUsage":{"uncachedInputTokens":200,"outputTokens":50,"cacheReadInputTokens":50000,"cacheWriteInputTokens":0}}',
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg).toBeDefined();
+    if (!msg) throw new Error("Expected a completed assistant message");
+
+    // Same components as the wire-total test above, which reports 50250.
+    expect(msg.usage.totalTokens).toBe(50250);
+
+    vi.unstubAllGlobals();
+  });
+
   it("passes through contextPercent even without usage event", async () => {
     const mockFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":42}');
     vi.stubGlobal("fetch", mockFetch);
