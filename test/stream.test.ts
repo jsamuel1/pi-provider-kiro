@@ -19,6 +19,7 @@ import {
   concatMessages,
   encodeEventMessage,
   encodeExceptionMessage,
+  encodeExceptionMessageWithRawBody,
   encodeRawExceptionMessage,
 } from "./helpers/event-stream.js";
 import { RECORD_279_COMMAND, RECORD_279_SUMMARY, RECORD_279_TEXT } from "./helpers/invoke-fixture.js";
@@ -3891,6 +3892,79 @@ describe("Feature 9: Streaming Integration", () => {
     const error = events.find((e) => e.type === "error");
     expect(error?.type === "error" && error.error.errorMessage).toContain("quotaExceededError");
     expect(error?.type === "error" && error.error.errorMessage).toContain("monthly quota gone");
+
+    vi.unstubAllGlobals();
+  }, 30000);
+
+  it("classifies an exception frame that names the exception class instead of the union member", async () => {
+    // `:exception-type` is chosen by the service and is not guaranteed to be the
+    // union member name: the hand-written event-stream bridge in the generated
+    // client for this same service accepts `throttlingError` OR
+    // `ThrottlingException` for every one of the four members.
+    //
+    // This is an end-to-end pin that a class-name token survives Smithy's
+    // exception framing intact. The classification itself (`kind: "throttling"`
+    // vs `"unknown"`) is asserted in test/event-parser.test.ts, because
+    // `KiroErrorData.kind` is not yet surfaced on the emitted AssistantMessage —
+    // the diagnostics card owns that.
+    const mockFetch = vi.fn().mockImplementation(async () => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({
+              done: false,
+              value: encodeRawExceptionMessage("ServiceUnavailableException", { message: "capacity exhausted" }),
+            })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          cancel: vi.fn().mockResolvedValue(undefined),
+          releaseLock: () => {},
+        }),
+      },
+    }));
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const error = events.find((e) => e.type === "error");
+    expect(error?.type === "error" && error.error.errorMessage).toContain("ServiceUnavailableException");
+    expect(error?.type === "error" && error.error.errorMessage).toContain("capacity exhausted");
+
+    vi.unstubAllGlobals();
+  }, 30000);
+
+  it("keeps the modeled class when an exception frame body is not parseable JSON", async () => {
+    // The class is a header, so it survives a body this client cannot read.
+    // Parsing before the exception branch threw a SyntaxError out of the
+    // deserializer, and the caller reported "Unexpected end of JSON input" with
+    // the modeled class gone — the same class loss, reintroduced by a truncated
+    // or non-JSON body.
+    const mockFetch = vi.fn().mockImplementation(async () => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({
+              done: false,
+              value: encodeExceptionMessageWithRawBody("throttlingError", ""),
+            })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          cancel: vi.fn().mockResolvedValue(undefined),
+          releaseLock: () => {},
+        }),
+      },
+    }));
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const error = events.find((e) => e.type === "error");
+    expect(error?.type === "error" && error.error.errorMessage).toContain("ThrottlingException");
+    expect(error?.type === "error" && error.error.errorMessage).not.toContain("JSON");
 
     vi.unstubAllGlobals();
   }, 30000);

@@ -82,13 +82,28 @@ export function encodeExceptionMessage(exceptionType: KiroEventKey, payload: obj
  * still surface its `:exception-type` name rather than a bare JSON body.
  */
 export function encodeRawExceptionMessage(exceptionType: string, payload: object): Uint8Array {
+  return encodeExceptionFrame(exceptionType, JSON.stringify(payload));
+}
+
+/**
+ * Encode an exception frame whose body is NOT parseable JSON.
+ *
+ * The modeled class lives in the `:exception-type` header, so it must survive a
+ * body this client cannot read — otherwise the JSON parse failure replaces the
+ * modeled error with a `SyntaxError` message and the class is lost.
+ */
+export function encodeExceptionMessageWithRawBody(exceptionType: string, body: string): Uint8Array {
+  return encodeExceptionFrame(exceptionType, body);
+}
+
+function encodeExceptionFrame(exceptionType: string, body: string): Uint8Array {
   return codec.encode({
     headers: {
       ":exception-type": { type: "string", value: exceptionType },
       ":message-type": { type: "string", value: "exception" },
       ":content-type": { type: "string", value: "application/json" },
     },
-    body: new TextEncoder().encode(JSON.stringify(payload)),
+    body: new TextEncoder().encode(body),
   });
 }
 

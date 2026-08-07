@@ -100,6 +100,30 @@ describe("Feature 8: Stream Event Parsing", () => {
     it("returns null for an unrecognized key with an unrecognized payload", () => {
       expect(parseKiroEvent("brandNewEvent", { unknown: true })).toBeNull();
     });
+
+    it("routes an error member delivered under its exception class name", () => {
+      // Same dual vocabulary as `:exception-type` (see parseKiroExceptionFrame).
+      // On the event-frame path there is no literal case label for the class
+      // name, so without the token lookup in `default:` the payload
+      // `{message, reason}` matches nothing in the shape ladder and the frame is
+      // dropped — the original class loss, one layer over.
+      const e = parseKiroEvent("ThrottlingException", {
+        message: "Too many requests",
+        reason: "INSUFFICIENT_MODEL_CAPACITY",
+        retryAfterMilliseconds: 4500,
+      });
+      expect(e).toEqual({
+        type: "error",
+        data: {
+          error: "ThrottlingException",
+          message: "Too many requests",
+          kind: "throttling",
+          reason: "INSUFFICIENT_MODEL_CAPACITY",
+          retryAfterMilliseconds: 4500,
+        },
+      });
+      expect(parseKiroEvent("ServiceUnavailableException", { message: "down" })?.type).toBe("error");
+    });
   });
 
   describe("parseKiroEvent — metadataEvent token usage", () => {
@@ -256,6 +280,43 @@ describe("Feature 8: Stream Event Parsing", () => {
     it("returns null for a non-error member so the caller keeps the raw body", () => {
       expect(parseKiroExceptionFrame("metadataEvent", { tokenUsage: {} })).toBeNull();
       expect(parseKiroExceptionFrame("SomeFutureException", { message: "x" })).toBeNull();
+    });
+
+    it("accepts the exception CLASS name as the :exception-type token", () => {
+      // The service is not required to put the union member name in
+      // `:exception-type`. The hand-written bridge in the generated client for
+      // this same service accepts either form for all four members
+      // (sse-middleware.ts `buildStreamException`), so both are observed
+      // vocabulary. Keying only on the member name would classify
+      // `ThrottlingException` as `kind: "unknown"` and drop the throttle
+      // classification that retry policy depends on.
+      expect(
+        parseKiroExceptionFrame("ThrottlingException", {
+          message: "Too many requests",
+          reason: "INSUFFICIENT_MODEL_CAPACITY",
+          retryAfterMilliseconds: 4500,
+        }),
+      ).toEqual({
+        error: "ThrottlingException",
+        message: "Too many requests",
+        kind: "throttling",
+        reason: "INSUFFICIENT_MODEL_CAPACITY",
+        retryAfterMilliseconds: 4500,
+      });
+      expect(parseKiroExceptionFrame("InternalServerException", { message: "boom" })?.kind).toBe("internalServer");
+      expect(parseKiroExceptionFrame("ValidationException", { message: "bad" })?.kind).toBe("validation");
+      expect(parseKiroExceptionFrame("ServiceUnavailableException", { message: "down" })?.kind).toBe(
+        "serviceUnavailable",
+      );
+    });
+
+    it("classifies a header-only exception frame from its token alone", () => {
+      // An unreadable body leaves an empty payload; the class still comes from
+      // the header, so the member must not degrade to unknown.
+      expect(parseKiroExceptionFrame("throttlingError", {})).toEqual({
+        error: "ThrottlingException",
+        kind: "throttling",
+      });
     });
 
     it("does not treat an Object.prototype key as a modeled member", () => {

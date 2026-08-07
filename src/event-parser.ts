@@ -73,16 +73,37 @@ export const KIRO_ERROR_MEMBERS: Readonly<Record<string, { kind: KiroErrorKind; 
 };
 
 /**
- * Look up an error member by a key the SERVICE chose.
+ * The token the service puts in `:exception-type` is not guaranteed to be the
+ * union member name. The hand-written event-stream bridge in the generated
+ * client for THIS service (`sse-middleware.ts`, `buildStreamException`) accepts
+ * either form for every one of the four members — `throttlingError` OR
+ * `ThrottlingException` — and does so on both its exception-frame and its
+ * defensive event-frame path. That is the same service, so both tokens are
+ * observed vocabulary, not speculation.
  *
- * `KIRO_ERROR_MEMBERS` is an ordinary object literal, so a bare index would
+ * Keyed separately from `KIRO_EVENT_MEMBERS` because a class name is NOT a
+ * `ChatResponseStream` member: `KIRO_EVENT_KEYS` stays the union's enumeration
+ * and keeps guarding fixture encoding.
+ */
+const KIRO_ERROR_TOKENS: Readonly<Record<string, { kind: KiroErrorKind; exception: string }>> = {
+  ...KIRO_ERROR_MEMBERS,
+  InternalServerException: KIRO_ERROR_MEMBERS.error,
+  ThrottlingException: KIRO_ERROR_MEMBERS.throttlingError,
+  ValidationException: KIRO_ERROR_MEMBERS.validationError,
+  ServiceUnavailableException: KIRO_ERROR_MEMBERS.serviceUnavailableError,
+};
+
+/**
+ * Look up an error member by a token the SERVICE chose.
+ *
+ * `KIRO_ERROR_TOKENS` is an ordinary object literal, so a bare index would
  * also resolve inherited `Object.prototype` members: an `:exception-type` of
  * `toString` or `constructor` returns a truthy value whose `kind` and
  * `exception` are both undefined, silently discarding the member name this
  * routing exists to preserve. Only own properties count as modeled members.
  */
-function lookupErrorMember(key: string): { kind: KiroErrorKind; exception: string } | undefined {
-  return Object.hasOwn(KIRO_ERROR_MEMBERS, key) ? KIRO_ERROR_MEMBERS[key] : undefined;
+export function lookupKiroErrorMember(key: string): { kind: KiroErrorKind; exception: string } | undefined {
+  return Object.hasOwn(KIRO_ERROR_TOKENS, key) ? KIRO_ERROR_TOKENS[key] : undefined;
 }
 
 export type KiroErrorData = {
@@ -240,7 +261,7 @@ export function parseKiroEvent(key: string, parsed: Record<string, unknown>): Ki
     case "validationError":
     case "serviceUnavailableError": {
       // Literal case labels, so the own-property lookup always resolves.
-      const member = lookupErrorMember(key) as { kind: KiroErrorKind; exception: string };
+      const member = lookupKiroErrorMember(key) as { kind: KiroErrorKind; exception: string };
       return parseError(parsed, member.kind, member.exception);
     }
     // Known members with no consumer yet: explicitly ignored, not unparseable.
@@ -248,24 +269,33 @@ export function parseKiroEvent(key: string, parsed: Record<string, unknown>): Ki
     case "documentCitationEvent":
     case "toolResultEvent":
       return { type: "ignored", data: { key } };
-    default:
+    default: {
+      // An error member delivered under its exception CLASS name rather than its
+      // union member name (see KIRO_ERROR_TOKENS). Classify before shape
+      // sniffing: an exception payload is `{message, reason?}`, which the
+      // fallback ladder matches on nothing and drops — losing the class exactly
+      // the way the old field ladder did.
+      const member = lookupKiroErrorMember(key);
+      if (member) return parseError(parsed, member.kind, member.exception);
       return parseKiroEventByShape(parsed);
+    }
   }
 }
 
 /**
- * Route an `:message-type: exception` frame by its `:exception-type` key.
+ * Route an `:message-type: exception` frame by its `:exception-type` token.
  *
  * The Smithy marshaller throws whatever the deserializer returns for that key,
  * so this is the only place the modeled exception class, `reason`, and
- * `retryAfterMilliseconds` are still structured. Returns `null` for a member
- * that is not one of the four modeled errors; the caller is responsible for
- * still preserving that member's name (see `src/stream.ts`), because Smithy's
- * own raw-body fallback only fires for a `$unknown` result this deserializer
- * never produces.
+ * `retryAfterMilliseconds` are still structured. Accepts either token form the
+ * service uses (union member name or exception class name). Returns `null` for
+ * a token that is not one of the four modeled errors; the caller is responsible
+ * for still preserving that name (see `src/stream.ts`), because Smithy's own
+ * raw-body fallback only fires for a `$unknown` result this deserializer never
+ * produces.
  */
 export function parseKiroExceptionFrame(key: string, parsed: Record<string, unknown>): KiroErrorData | null {
-  const member = lookupErrorMember(key);
+  const member = lookupKiroErrorMember(key);
   if (!member) return null;
   const event = parseError(parsed, member.kind, member.exception);
   return event.data;

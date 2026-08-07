@@ -870,13 +870,27 @@ export function streamKiro(
           const entry = Object.entries(event)[0];
           if (!entry) throw new Error("Received an empty event stream message");
           const [key, msg] = entry;
-          const parsed = JSON.parse(utf8Decoder.decode(msg.body)) as Record<string, unknown>;
           // The four error members of ChatResponseStream target `@error` shapes,
           // so the service frames them as `:message-type: exception`. The
           // marshaller keys those by `:exception-type` and throws whatever this
           // callback returns, so returning the bare payload would discard the
           // modeled class. Return an Error carrying the parsed detail instead.
           if (msg.headers[":message-type"]?.value === "exception") {
+            // Parsed defensively, and BEFORE the shared parse below: an exception
+            // body that is empty or not JSON would otherwise throw a SyntaxError
+            // out of this deserializer, and the caller would report
+            // "Unexpected end of JSON input" with the modeled class gone — the
+            // exact loss this routing removes. The class lives in the header, so
+            // it survives a body we cannot read. The same-service client's own
+            // bridge takes this position too (sse-middleware.ts: "Non-JSON body:
+            // still throw a typed exception with a fallback message").
+            let parsedException: Record<string, unknown> = {};
+            try {
+              const decoded = JSON.parse(utf8Decoder.decode(msg.body)) as unknown;
+              if (decoded && typeof decoded === "object") parsedException = decoded as Record<string, unknown>;
+            } catch {
+              // Header-only classification below.
+            }
             // An unmodeled member (a fifth error added server-side, or `$unknown`)
             // still arrives keyed by `:exception-type`. Smithy's own fail-open path
             // is unreachable here — it only triggers when the deserializer returns
@@ -884,13 +898,13 @@ export function streamKiro(
             // fallback the marshaller would throw the bare parsed body and the
             // member name would be lost in exactly the way this routing exists to
             // prevent. Synthesize the same typed shape with `kind: "unknown"`.
-            const data: KiroErrorData = parseKiroExceptionFrame(key, parsed) ?? {
+            const data: KiroErrorData = parseKiroExceptionFrame(key, parsedException) ?? {
               error: key,
               kind: "unknown",
-              ...(typeof parsed.message === "string" ? { message: parsed.message } : {}),
-              ...(typeof parsed.reason === "string" ? { reason: parsed.reason } : {}),
-              ...(typeof parsed.retryAfterMilliseconds === "number"
-                ? { retryAfterMilliseconds: parsed.retryAfterMilliseconds }
+              ...(typeof parsedException.message === "string" ? { message: parsedException.message } : {}),
+              ...(typeof parsedException.reason === "string" ? { reason: parsedException.reason } : {}),
+              ...(typeof parsedException.retryAfterMilliseconds === "number"
+                ? { retryAfterMilliseconds: parsedException.retryAfterMilliseconds }
                 : {}),
             };
             const error = new Error(data.message ? `${data.error}: ${data.message}` : data.error);
@@ -898,6 +912,7 @@ export function streamKiro(
             (error as Error & { kiroError?: KiroErrorData }).kiroError = data;
             return { [key]: error } as Record<string, unknown>;
           }
+          const parsed = JSON.parse(utf8Decoder.decode(msg.body)) as Record<string, unknown>;
           return { [key]: parsed } as Record<string, unknown>;
         });
         const iterator = eventStream[Symbol.asyncIterator]() as AsyncIterator<Record<string, unknown>>;
