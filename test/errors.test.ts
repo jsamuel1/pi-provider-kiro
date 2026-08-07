@@ -318,6 +318,51 @@ describe("typed classification per reason code", () => {
     }
   });
 
+  it("reports consumed 403 credential-refresh retries in providerAttempts", async () => {
+    // Two 403s each burn one credential-refresh retry, then a terminal 400
+    // reaches a throw site. The tally must survive both outer-loop iterations:
+    // `capacityRetryCount` is deliberately reset per iteration, so a
+    // per-iteration counter would report 0 here.
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+        statusText: "Forbidden",
+        text: () => Promise.resolve("Access denied"),
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+        statusText: "Forbidden",
+        text: () => Promise.resolve("Access denied"),
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 400,
+        statusText: "Bad Request",
+        text: () => Promise.resolve("Invalid parameter: modelId"),
+      });
+    vi.stubGlobal("fetch", mockFetch);
+    resetProfileArnCache(true);
+    try {
+      const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      const error = events.find((e) => e.type === "error");
+      if (!error || error.type !== "error") throw new Error("expected a terminal error event");
+
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+      expect(kiroDiagnostic(error.error)?.details).toMatchObject({
+        status: 400,
+        providerAttempts: { credentialRefresh: 2, capacity: 0 },
+      });
+      // The message stays the plain generic form — the retry accounting is
+      // only ever on the type, never in the text.
+      expect(error.error.errorMessage).toBe("Kiro API error: 400 Bad Request Invalid parameter: modelId");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("classifies REQUEST_BODY_INVALID and does NOT call it too-big", async () => {
     const model = makeModel();
     const message = await failedRequest(
