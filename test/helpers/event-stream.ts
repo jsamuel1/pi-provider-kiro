@@ -35,6 +35,10 @@ export function inferEventKey(payload: Record<string, unknown>): KiroEventKey | 
  * `eventType` defaults to the member inferred from the payload shape; pass it
  * explicitly to exercise a specific union member (including error members,
  * which share field names with each other).
+ *
+ * Note: the four error members target `@error` shapes, so the service frames
+ * them as `:message-type: exception`. Use {@link encodeExceptionMessage} for
+ * those; this function is for ordinary `event` frames.
  */
 export function encodeEventMessage(payload: object, eventType?: KiroEventKey | "$unknown"): Uint8Array {
   const key = eventType ?? inferEventKey(payload as Record<string, unknown>);
@@ -45,6 +49,28 @@ export function encodeEventMessage(payload: object, eventType?: KiroEventKey | "
     headers: {
       ":event-type": { type: "string", value: key },
       ":message-type": { type: "string", value: "event" },
+    },
+    body: new TextEncoder().encode(JSON.stringify(payload)),
+  });
+}
+
+/**
+ * Encode a modeled error member the way the service actually frames it.
+ *
+ * `ChatResponseStream`'s `error` / `throttlingError` / `validationError` /
+ * `serviceUnavailableError` members target `@error` shapes, so they arrive as
+ * `:message-type: exception` with the member name in `:exception-type` — the
+ * Smithy marshaller routes those through a different path than event frames.
+ */
+export function encodeExceptionMessage(exceptionType: KiroEventKey, payload: object): Uint8Array {
+  if (!isKiroEventKey(exceptionType)) {
+    throw new Error(`Not a ChatResponseStream member: ${exceptionType}`);
+  }
+  return codec.encode({
+    headers: {
+      ":exception-type": { type: "string", value: exceptionType },
+      ":message-type": { type: "string", value: "exception" },
+      ":content-type": { type: "string", value: "application/json" },
     },
     body: new TextEncoder().encode(JSON.stringify(payload)),
   });

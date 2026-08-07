@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { findJsonEnd } from "../src/bracket-tool-parser.js";
-import { parseKiroEvent, parseKiroEventByShape } from "../src/event-parser.js";
+import { parseKiroEvent, parseKiroEventByShape, parseKiroExceptionFrame } from "../src/event-parser.js";
 
 describe("Feature 8: Stream Event Parsing", () => {
   describe("findJsonEnd", () => {
@@ -165,6 +165,10 @@ describe("Feature 8: Stream Event Parsing", () => {
   });
 
   describe("parseKiroEvent — error members keep their modeled class", () => {
+    // These four members target @error shapes, so the service frames them as
+    // `:message-type: exception` (see parseKiroExceptionFrame). The event-frame
+    // branches below exist so a non-conforming server that sends them as
+    // ordinary events is classified identically rather than dropped.
     it("classifies the error member as internalServer", () => {
       expect(parseKiroEvent("error", { message: "boom" })).toEqual({
         type: "error",
@@ -205,6 +209,39 @@ describe("Feature 8: Stream Event Parsing", () => {
         type: "error",
         data: { error: "ThrottlingException", message: "slow down", kind: "internalServer" },
       });
+    });
+  });
+
+  describe("parseKiroExceptionFrame — the real wire framing for error members", () => {
+    it("maps every error member to its modeled exception class", () => {
+      expect(parseKiroExceptionFrame("error", { message: "boom" })).toEqual({
+        error: "InternalServerException",
+        message: "boom",
+        kind: "internalServer",
+      });
+      expect(parseKiroExceptionFrame("validationError", { message: "bad" })?.kind).toBe("validation");
+      expect(parseKiroExceptionFrame("serviceUnavailableError", { message: "down" })?.kind).toBe("serviceUnavailable");
+    });
+
+    it("preserves reason and retryAfterMilliseconds for throttlingError", () => {
+      expect(
+        parseKiroExceptionFrame("throttlingError", {
+          message: "Too many requests",
+          reason: "INSUFFICIENT_MODEL_CAPACITY",
+          retryAfterMilliseconds: 4500,
+        }),
+      ).toEqual({
+        error: "ThrottlingException",
+        message: "Too many requests",
+        kind: "throttling",
+        reason: "INSUFFICIENT_MODEL_CAPACITY",
+        retryAfterMilliseconds: 4500,
+      });
+    });
+
+    it("returns null for a non-error member so the caller keeps the raw body", () => {
+      expect(parseKiroExceptionFrame("metadataEvent", { tokenUsage: {} })).toBeNull();
+      expect(parseKiroExceptionFrame("SomeFutureException", { message: "x" })).toBeNull();
     });
   });
 

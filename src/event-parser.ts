@@ -52,6 +52,19 @@ export type KiroUsageData = {
 /** Which modeled union member produced an error event. */
 export type KiroErrorKind = "internalServer" | "throttling" | "validation" | "serviceUnavailable" | "unknown";
 
+/**
+ * The four error members of `ChatResponseStream` target `@error` shapes, so the
+ * service frames them as `:message-type: exception` with the union member name
+ * in `:exception-type` — not as ordinary `event` frames. Mapping the member to
+ * its exception class here keeps both framings on one table.
+ */
+export const KIRO_ERROR_MEMBERS: Readonly<Record<string, { kind: KiroErrorKind; exception: string }>> = {
+  error: { kind: "internalServer", exception: "InternalServerException" },
+  throttlingError: { kind: "throttling", exception: "ThrottlingException" },
+  validationError: { kind: "validation", exception: "ValidationException" },
+  serviceUnavailableError: { kind: "serviceUnavailable", exception: "ServiceUnavailableException" },
+};
+
 export type KiroErrorData = {
   /** Exception class name, or the legacy free-form `error` string. */
   error: string;
@@ -133,7 +146,11 @@ function parseMetadata(parsed: Record<string, unknown>): KiroStreamEvent | null 
   return Object.keys(data).length > 0 ? { type: "usage", data } : null;
 }
 
-function parseError(parsed: Record<string, unknown>, kind: KiroErrorKind, fallbackName: string): KiroStreamEvent {
+function parseError(
+  parsed: Record<string, unknown>,
+  kind: KiroErrorKind,
+  fallbackName: string,
+): { type: "error"; data: KiroErrorData } {
   // Modeled exceptions carry {message, reason?, retryAfterMilliseconds?}; older
   // free-form frames carry {error, message}. Accept both.
   const rawError = parsed.error ?? parsed.Error;
@@ -188,14 +205,16 @@ export function parseKiroEvent(key: string, parsed: Record<string, unknown>): Ki
         type: "metering",
         data: { credits: num(parsed.usage), unit: str(parsed.unit), unitPlural: str(parsed.unitPlural) },
       };
+    // Reachable when a member that models an exception is delivered as an
+    // ordinary event frame. The real wire uses exception framing, handled by
+    // parseKiroExceptionFrame, but both routes must agree.
     case "error":
-      return parseError(parsed, "internalServer", "InternalServerException");
     case "throttlingError":
-      return parseError(parsed, "throttling", "ThrottlingException");
     case "validationError":
-      return parseError(parsed, "validation", "ValidationException");
-    case "serviceUnavailableError":
-      return parseError(parsed, "serviceUnavailable", "ServiceUnavailableException");
+    case "serviceUnavailableError": {
+      const member = KIRO_ERROR_MEMBERS[key];
+      return parseError(parsed, member.kind, member.exception);
+    }
     // Known members with no consumer yet: explicitly ignored, not unparseable.
     case "codeReferenceEvent":
     case "documentCitationEvent":
@@ -204,6 +223,21 @@ export function parseKiroEvent(key: string, parsed: Record<string, unknown>): Ki
     default:
       return parseKiroEventByShape(parsed);
   }
+}
+
+/**
+ * Route an `:message-type: exception` frame by its `:exception-type` key.
+ *
+ * The Smithy marshaller throws whatever the deserializer returns for that key,
+ * so this is the only place the modeled exception class, `reason`, and
+ * `retryAfterMilliseconds` are still structured. Unknown keys yield `null` so
+ * the caller can fall back to the raw body.
+ */
+export function parseKiroExceptionFrame(key: string, parsed: Record<string, unknown>): KiroErrorData | null {
+  const member = KIRO_ERROR_MEMBERS[key];
+  if (!member) return null;
+  const event = parseError(parsed, member.kind, member.exception);
+  return event.data;
 }
 
 /**

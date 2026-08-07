@@ -28,7 +28,7 @@ import {
   type KiroAdditionalModelRequestFields,
 } from "./effort.js";
 import { getKiroEndpoints, getKiroRegionFromEndpoint } from "./endpoints.js";
-import { type KiroUsageData, parseKiroEvent } from "./event-parser.js";
+import { type KiroErrorData, type KiroUsageData, parseKiroEvent, parseKiroExceptionFrame } from "./event-parser.js";
 import {
   addPlaceholderTools,
   assertHistoryWithinLimit,
@@ -823,6 +823,11 @@ export function streamKiro(
         let gotFirstToken = false;
         let firstTokenTimedOut = false;
         let streamError: string | null = null;
+        // Structured detail for the last modeled exception frame. The message
+        // string stays the retry/throw contract; this keeps `kind`, `reason`,
+        // and `retryAfterMilliseconds` addressable instead of only readable as
+        // prose inside that string.
+        let streamErrorData: KiroErrorData | null = null;
         const FIRST_TOKEN_SENTINEL = Symbol("firstTokenTimeout");
 
         // Smithy EventStreamMarshaller handles: chunk reassembly, CRC validation,
@@ -846,6 +851,20 @@ export function streamKiro(
           if (!entry) throw new Error("Received an empty event stream message");
           const [key, msg] = entry;
           const parsed = JSON.parse(utf8Decoder.decode(msg.body)) as Record<string, unknown>;
+          // The four error members of ChatResponseStream target `@error` shapes,
+          // so the service frames them as `:message-type: exception`. The
+          // marshaller keys those by `:exception-type` and throws whatever this
+          // callback returns, so returning the bare payload would discard the
+          // modeled class. Return an Error carrying the parsed detail instead.
+          if (msg.headers[":message-type"]?.value === "exception") {
+            const data = parseKiroExceptionFrame(key, parsed);
+            if (data) {
+              const error = new Error(data.message ? `${data.error}: ${data.message}` : data.error);
+              error.name = data.error;
+              (error as Error & { kiroError?: KiroErrorData }).kiroError = data;
+              return { [key]: error } as Record<string, unknown>;
+            }
+          }
           return { [key]: parsed } as Record<string, unknown>;
         });
         const iterator = eventStream[Symbol.asyncIterator]() as AsyncIterator<Record<string, unknown>>;
@@ -874,7 +893,11 @@ export function streamKiro(
               iterResult = await iterator.next();
             }
           } catch (e) {
-            // Smithy throws on :message-type error/exception headers
+            // Smithy throws on :message-type error/exception headers. A modeled
+            // exception frame arrives here as the Error built in the
+            // deserializer above, with its parsed detail attached.
+            const kiroError = (e as { kiroError?: KiroErrorData } | null)?.kiroError;
+            if (kiroError) streamErrorData = kiroError;
             streamError =
               e instanceof Error
                 ? e.message
@@ -981,6 +1004,7 @@ export function streamKiro(
             case "error": {
               const errMsg = event.data.message ? `${event.data.error}: ${event.data.message}` : event.data.error;
               streamError = errMsg;
+              streamErrorData = event.data;
               void bodyReader.cancel().catch(() => {});
               break;
             }
@@ -994,6 +1018,9 @@ export function streamKiro(
           if (retryCount < maxRetries) {
             retryCount++;
             const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY);
+            if (streamErrorData && debugEnabled()) {
+              debugLog("stream.error.typed", [streamErrorData]);
+            }
             // `output` is created once outside the retry loop, so anything the
             // aborted attempt already appended survives into the next one. A
             // typed error frame (throttling/validation/serviceUnavailable) can

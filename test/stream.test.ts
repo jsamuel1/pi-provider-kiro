@@ -15,7 +15,7 @@ import { validateKiroConversation, validateKiroToolStructure } from "../src/hist
 import { capacityRetryConfig, retryConfig } from "../src/retry.js";
 import { resetProfileArnCache, streamKiro } from "../src/stream.js";
 import { EMPTY_CONTENT_PLACEHOLDER, type KiroHistoryEntry } from "../src/transform.js";
-import { concatMessages, encodeEventMessage } from "./helpers/event-stream.js";
+import { concatMessages, encodeEventMessage, encodeExceptionMessage } from "./helpers/event-stream.js";
 import { RECORD_279_COMMAND, RECORD_279_SUMMARY, RECORD_279_TEXT } from "./helpers/invoke-fixture.js";
 
 const ts = Date.now();
@@ -3719,9 +3719,9 @@ describe("Feature 9: Streaming Integration", () => {
 
   it("surfaces a mid-stream throttlingError frame and retries", async () => {
     // throttlingError / validationError / serviceUnavailableError are distinct
-    // ChatResponseStream members. Before key routing they matched no branch and
-    // were dropped, so the turn looked like an empty response. Now they abort
-    // the read and enter the retry path with the modeled class in the message.
+    // ChatResponseStream members targeting @error shapes, so the service frames
+    // them as `:message-type: exception`. Before key routing they reached the
+    // caller only as an opaque JSON blob with the modeled class discarded.
     let callCount = 0;
     const mockFetch = vi.fn().mockImplementation(async () => {
       callCount++;
@@ -3736,14 +3736,11 @@ describe("Feature 9: Streaming Integration", () => {
                   done: false,
                   value: concatMessages(
                     encodeEventMessage({ content: "partial" }),
-                    encodeEventMessage(
-                      {
-                        message: "Too many requests",
-                        reason: "INSUFFICIENT_MODEL_CAPACITY",
-                        retryAfterMilliseconds: 10,
-                      },
-                      "throttlingError",
-                    ),
+                    encodeExceptionMessage("throttlingError", {
+                      message: "Too many requests",
+                      reason: "INSUFFICIENT_MODEL_CAPACITY",
+                      retryAfterMilliseconds: 10,
+                    }),
                   ),
                 })
                 .mockResolvedValueOnce({ done: true, value: undefined }),
@@ -3783,6 +3780,10 @@ describe("Feature 9: Streaming Integration", () => {
   });
 
   it("reports the modeled exception class when a typed error frame outlives every retry", async () => {
+    // Exception-framed member: the marshaller throws whatever the deserializer
+    // returns for the `:exception-type` key, so the class name only survives if
+    // that callback recognizes the member. Returning the bare payload would
+    // surface `{"message":"capacity exhausted"}` with no class at all.
     const mockFetch = vi.fn().mockImplementation(async () => ({
       ok: true,
       body: {
@@ -3791,7 +3792,7 @@ describe("Feature 9: Streaming Integration", () => {
             .fn()
             .mockResolvedValueOnce({
               done: false,
-              value: encodeEventMessage({ message: "capacity exhausted" }, "serviceUnavailableError"),
+              value: encodeExceptionMessage("serviceUnavailableError", { message: "capacity exhausted" }),
             })
             .mockResolvedValueOnce({ done: true, value: undefined }),
           cancel: vi.fn().mockResolvedValue(undefined),
@@ -3838,7 +3839,7 @@ describe("Feature 9: Streaming Integration", () => {
                         cacheWriteInputTokens: 7,
                       },
                     }),
-                    encodeEventMessage({ message: "throttled" }, "throttlingError"),
+                    encodeExceptionMessage("throttlingError", { message: "throttled" }),
                   ),
                 })
                 .mockResolvedValueOnce({ done: true, value: undefined }),
