@@ -120,6 +120,30 @@ describe("applyMeteringCredits", () => {
     expect(usage.credits).toBeUndefined();
     expect(usage.creditUnit).toBeUndefined();
   });
+
+  it("keeps the singular unit when a later frame carries units but no count", () => {
+    const usage = freshUsage();
+    applyMeteringCredits(usage, 1, "credit", "credits");
+    expect(usage.creditUnit).toBe("credit");
+
+    // Every MeteringEvent field is optional, so a later frame can repeat the unit
+    // strings with no `usage` number. Agreement must be decided against the count
+    // already recorded, not against this call's absent argument, or the recorded
+    // single credit is re-pluralized into "1 credits".
+    applyMeteringCredits(usage, undefined, "credit", "credits");
+
+    expect(usage.credits).toBe(1);
+    expect(usage.creditUnit).toBe("credit");
+  });
+
+  it("repluralizes when a later frame revises the count upward", () => {
+    const usage = freshUsage();
+    applyMeteringCredits(usage, 1, "credit", "credits");
+    applyMeteringCredits(usage, 4, "credit", "credits");
+
+    expect(usage.credits).toBe(4);
+    expect(usage.creditUnit).toBe("credits");
+  });
 });
 
 describe("finalizeKiroUsage", () => {
@@ -268,9 +292,15 @@ describe("finalizeKiroUsage", () => {
     expect(usage.cacheRead).toBe(8_000);
     expect(usage.provenance?.cache).toBe("measured");
     expect(usage.input).toBe(12_000);
-    // The four slots are disjoint, so they sum back to the derived prompt total
-    // (20000) plus output — not 28050.
+    // The three prompt slots no longer overlap, so cost is charged once per
+    // cached token: 12000 back to the derived figure of 20000.
     expect(usage.input + usage.cacheRead + usage.cacheWrite).toBe(20_000);
+    // The recomputed total is 20050, and it is knowingly imprecise: the 20000 it
+    // builds on was back-computed from contextUsagePercentage, which the service
+    // derives from totalTokens — output tokens included. So those 50 output
+    // tokens are counted twice here. Unavoidable without a measured input, and
+    // marked "estimated" for exactly that reason. Only reachable when the wire
+    // omitted the required totalTokens field.
     expect(usage.totalTokens).toBe(20_050);
     expect(usage.provenance?.totalTokens).toBe("estimated");
   });

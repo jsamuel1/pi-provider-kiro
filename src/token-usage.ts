@@ -100,6 +100,15 @@ export function resetKiroUsage(usage: KiroUsage): void {
  * `"derived"` so {@link finalizeKiroUsage} can overwrite it with the measured
  * count once metadata lands. `contextPercent` itself is always the service's
  * own number and is never re-derived from tokens.
+ *
+ * Note what the percentage actually measures: the service computes it as
+ * `(totalTokens / maxContextWindowTokens) * 100`, and `totalTokens` spans the
+ * WHOLE turn — uncached input, cache reads/writes AND output. So this figure is
+ * an approximation of `totalTokens`, not of the `input` slot it is parked in.
+ * That is tolerable only because it is provisional: a measured
+ * `uncachedInputTokens` replaces it, and a measured `totalTokens` replaces any
+ * total recomputed from it. See {@link finalizeKiroUsage} for what remains
+ * imprecise when the wire omits both.
  */
 export function applyContextUsage(usage: KiroUsage, contextUsagePercentage: number, contextWindow: number): void {
   if (!isCount(contextUsagePercentage)) return;
@@ -121,12 +130,17 @@ const nonEmpty = (v: unknown): string | undefined => (typeof v === "string" && v
  * one that agrees with the count is selected here rather than at the call site:
  * storing `unitPlural` unconditionally renders "1 credits". Zero takes the
  * plural, as English does. Either form alone is used as-is.
+ *
+ * Agreement is decided against the count now held on `usage`, not against this
+ * call's `credits` argument. Every `MetadataEvent`/`MeteringEvent` field is
+ * optional, so a later frame can carry the unit strings while omitting `usage`;
+ * reading the argument would then re-pluralize an already-recorded count of 1.
  */
 export function applyMeteringCredits(usage: KiroUsage, credits?: number, unit?: string, unitPlural?: string): void {
   if (isCount(credits)) usage.credits = credits;
   const singular = nonEmpty(unit);
   const plural = nonEmpty(unitPlural);
-  const preferred = credits === 1 ? (singular ?? plural) : (plural ?? singular);
+  const preferred = usage.credits === 1 ? (singular ?? plural) : (plural ?? singular);
   if (preferred !== undefined) usage.creditUnit = preferred;
 }
 
@@ -190,6 +204,19 @@ export function finalizeKiroUsage(
     }
   }
 
+  // What the subtraction above does and does not achieve: it stops the cached
+  // tokens being priced twice (once inside the derived `input`, once on
+  // `calculateCost`'s separate `cacheRead` line), which is the part that costs
+  // money. It does NOT make a derived `input` a true prompt-only figure — the
+  // percentage it came from spans the output tokens as well, and those cannot be
+  // subtracted out because the only output count available here may itself be an
+  // estimate. Consequence, confined to the recomputed-total branch below: when
+  // the input is derived AND the wire omitted `totalTokens`, the total
+  // over-reports by roughly the output count. Both conditions together are rare
+  // — `TokenUsage.totalTokens` is a required field, so any conforming
+  // `metadataEvent` supplies the authoritative total and this branch is skipped.
+  // The total is marked `"estimated"` in exactly that case.
+
   if (isCount(wire?.contextUsagePercentage)) usage.contextPercent = wire.contextUsagePercentage;
   if (isCount(wire?.normalizedTokenUsage)) usage.normalizedTokenUsage = wire.normalizedTokenUsage;
 
@@ -201,7 +228,10 @@ export function finalizeKiroUsage(
     usage.totalTokens = wire.totalTokens;
     provenance.totalTokens = "measured";
   } else {
-    // Safe unconditionally: the slots were normalized above to be disjoint.
+    // No authoritative total. Sum the four slots, which the normalization above
+    // made non-overlapping for cost purposes. Accurate when the input was
+    // measured; over-reports by roughly the output count when it was derived,
+    // per the note above — hence the provenance below.
     usage.totalTokens = usage.input + usage.cacheRead + usage.cacheWrite + usage.output;
     provenance.totalTokens =
       provenance.input === "measured" && provenance.output === "measured" ? "derived" : "estimated";
