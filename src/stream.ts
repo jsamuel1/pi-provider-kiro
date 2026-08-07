@@ -1049,6 +1049,12 @@ export function streamKiro(
             // retry below resets for the same reason. `textBlockIndex` and the
             // tool-call state are per-iteration and need no reset here; the
             // usage block is cleared by `resetAttemptUsage` at the loop top.
+            //
+            // pi's event protocol has no retraction event, so deltas already
+            // pushed for the abandoned attempt cannot be withdrawn. The signals
+            // a consumer does get are the fresh `start` emitted for the retried
+            // attempt and the `partial` carried on every event, which is this
+            // same `output` object and so reflects the clear.
             output.content = [];
             await abortableDelay(delayMs, options?.signal);
             continue;
