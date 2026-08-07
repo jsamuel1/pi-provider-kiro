@@ -66,6 +66,19 @@ describe("published package surface", () => {
     expect(pkg.scripts.build).toContain("tsc --emitDeclarationOnly");
   });
 
+  // Bundled CJS dependencies call `require("buffer")` — the @smithy/core
+  // event-stream marshaller `stream.ts` uses reaches it through util-utf8. In an
+  // ESM bundle esbuild's `__require` shim throws for those unless a real
+  // `require` is in scope, and the call sites sit inside lazily-initialised CJS
+  // wrappers, so dropping this banner still imports cleanly and only fails when
+  // a stream is actually opened. Nothing else catches that: the suite runs from
+  // src, never from dist.
+  it("gives the bundled CJS graph a real require", () => {
+    expect(pkg.scripts.build).toContain("--banner:js=");
+    expect(pkg.scripts.build).toMatch(/createRequire[^"]*from\s*'node:module'/);
+    expect(pkg.scripts.build).toMatch(/\brequire\s*=\s*\w*[cC]reateRequire\(import\.meta\.url\)/);
+  });
+
   // The bundle keeps pi's packages external, so they must be resolvable in the
   // consumer's tree. Declaring them makes that requirement machine-readable
   // instead of an ERR_MODULE_NOT_FOUND at first import; `optional` keeps npm
