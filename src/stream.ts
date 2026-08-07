@@ -347,8 +347,28 @@ export function streamKiro(
       let retryCount = 0;
       const maxRetries = 3;
       const conversationId = options?.sessionId ?? crypto.randomUUID();
+      // Every wire-derived usage figure is written straight onto `output`, which
+      // outlives the retry loop, so an abandoned attempt's accounting would
+      // otherwise be billed to the turn that replaced it. Two live paths:
+      // `contextUsageEvent` sets `usage.input`/`contextPercent` mid-stream, and
+      // the post-stream metadataEvent writes land *before* the empty-response /
+      // echo-loop retry check. Clearing at the attempt boundary keeps the whole
+      // usage block sourced from one attempt, matching how `usageEvent` itself
+      // is scoped per attempt.
+      const resetAttemptUsage = () => {
+        output.usage.input = 0;
+        output.usage.output = 0;
+        output.usage.cacheRead = 0;
+        output.usage.cacheWrite = 0;
+        output.usage.totalTokens = 0;
+        output.usage.cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+        // Not part of pi's Usage shape; only present once a contextUsageEvent
+        // has been seen, so a retried turn must not report the old gauge.
+        delete (output.usage as unknown as Record<string, unknown>).contextPercent;
+      };
       requestLoop: while (retryCount <= maxRetries) {
         if (options?.signal?.aborted) throw options.signal.reason;
+        resetAttemptUsage();
         const effectiveSystemPrompt = systemPrompt;
         // Relocate a tool result that arrived behind a later assistant turn than
         // the one that called it, before anything positional runs. Interleaved
@@ -1027,7 +1047,8 @@ export function streamKiro(
             // arrive after partial text, which would otherwise concatenate the
             // abandoned prefix onto the retried response. The empty-response
             // retry below resets for the same reason. `textBlockIndex` and the
-            // tool-call state are per-iteration and need no reset here.
+            // tool-call state are per-iteration and need no reset here; the
+            // usage block is cleared by `resetAttemptUsage` at the loop top.
             output.content = [];
             await abortableDelay(delayMs, options?.signal);
             continue;

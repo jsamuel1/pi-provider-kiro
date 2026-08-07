@@ -3886,6 +3886,142 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
+  it("does not inherit the failed attempt's contextUsage input when retrying", async () => {
+    // `contextUsageEvent` writes `output.usage.input` and `contextPercent`
+    // straight onto the shared message, which outlives the retry loop. Routing
+    // typed error members made a mid-stream throttle a live retry trigger, so
+    // without an attempt-boundary reset the retried turn is billed for the
+    // abandoned attempt's input and reports its context gauge.
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(async () => {
+      callCount++;
+      if (callCount === 1) {
+        return {
+          ok: true,
+          body: {
+            getReader: () => ({
+              read: vi
+                .fn()
+                .mockResolvedValueOnce({
+                  done: false,
+                  value: concatMessages(
+                    encodeEventMessage({ content: "partial" }),
+                    encodeEventMessage({ contextUsagePercentage: 90 }),
+                    encodeExceptionMessage("throttlingError", { message: "slow down" }),
+                  ),
+                })
+                .mockResolvedValueOnce({ done: true, value: undefined }),
+              cancel: vi.fn().mockResolvedValue(undefined),
+              releaseLock: () => {},
+            }),
+          },
+        };
+      }
+      // Retry succeeds reporting NO contextUsage and NO metadataEvent.
+      return {
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: vi
+              .fn()
+              .mockResolvedValueOnce({ done: false, value: encodeEventMessage({ content: "clean" }) })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            cancel: vi.fn().mockResolvedValue(undefined),
+            releaseLock: () => {},
+          }),
+        },
+      };
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg).toBeDefined();
+    if (!msg) throw new Error("Expected a completed assistant message");
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect((msg.content[0] as TextContent).text).toBe("clean");
+    // 90% of a 200000-token window is 180000 input tokens the retried turn
+    // never used.
+    expect(msg.usage.input).toBe(0);
+    expect((msg.usage as unknown as Record<string, unknown>).contextPercent).toBeUndefined();
+
+    vi.unstubAllGlobals();
+  });
+
+  it("does not inherit the failed attempt's token counts across an empty-response retry", async () => {
+    // The post-stream usage writes run BEFORE the empty-response retry check, so
+    // this path leaks differently from the mid-stream error path above. Routing
+    // metadataEvent made it reachable: previously the frame was dropped, so
+    // there were no wire counts to inherit.
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(async () => {
+      callCount++;
+      if (callCount === 1) {
+        // A metadataEvent with large counts and no text or tool calls at all.
+        return {
+          ok: true,
+          body: {
+            getReader: () => ({
+              read: vi
+                .fn()
+                .mockResolvedValueOnce({
+                  done: false,
+                  value: encodeEventMessage({
+                    tokenUsage: {
+                      uncachedInputTokens: 999,
+                      outputTokens: 111,
+                      totalTokens: 41110,
+                      cacheReadInputTokens: 40000,
+                      cacheWriteInputTokens: 7,
+                    },
+                  }),
+                })
+                .mockResolvedValueOnce({ done: true, value: undefined }),
+              cancel: vi.fn().mockResolvedValue(undefined),
+              releaseLock: () => {},
+            }),
+          },
+        };
+      }
+      return {
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: vi
+              .fn()
+              .mockResolvedValueOnce({ done: false, value: encodeEventMessage({ content: "clean" }) })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            cancel: vi.fn().mockResolvedValue(undefined),
+            releaseLock: () => {},
+          }),
+        },
+      };
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg).toBeDefined();
+    if (!msg) throw new Error("Expected a completed assistant message");
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect((msg.content[0] as TextContent).text).toBe("clean");
+    expect(msg.usage.input).toBe(0);
+    expect(msg.usage.cacheRead).toBe(0);
+    expect(msg.usage.cacheWrite).toBe(0);
+    // Output falls back to counting the recovered text, never the 111 reported
+    // by the abandoned attempt.
+    expect(msg.usage.output).toBeLessThan(111);
+    expect(msg.usage.totalTokens).toBe(msg.usage.output);
+
+    vi.unstubAllGlobals();
+  });
+
   it("falls back to summing components when a non-conforming frame omits totalTokens", async () => {
     // TokenUsage.totalTokens is required on the wire, so this branch only guards
     // a non-conforming server. The sum must match how the service itself defines

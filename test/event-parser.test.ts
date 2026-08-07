@@ -143,6 +143,20 @@ describe("Feature 8: Stream Event Parsing", () => {
       expect(e?.type === "usage" && e.data.stopDetails).toEqual({ refusal: { reason: "POLICY" } });
     });
 
+    it("surfaces normalizedTokenUsage, which is not a raw credit count", () => {
+      // TokenUsage.normalizedTokenUsage is MPS-normalized usage derived from
+      // credit information. It is modeled alongside the token counts, so it must
+      // not be dropped at the boundary, and it must not be confused with
+      // MeteringEvent.usage (raw credits).
+      const e = parseKiroEvent("metadataEvent", {
+        tokenUsage: { uncachedInputTokens: 10, outputTokens: 2, totalTokens: 12, normalizedTokenUsage: 3.5 },
+      });
+      expect(e).toEqual({
+        type: "usage",
+        data: { inputTokens: 10, outputTokens: 2, totalTokens: 12, normalizedTokenUsage: 3.5 },
+      });
+    });
+
     it("returns null for an empty metadataEvent", () => {
       expect(parseKiroEvent("metadataEvent", {})).toBeNull();
     });
