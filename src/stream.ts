@@ -63,6 +63,13 @@ import {
 } from "./retry.js";
 import { ThinkingTagParser } from "./thinking-parser.js";
 import { kiroTokenTypeHeaders } from "./token-type.js";
+import {
+  applyContextUsage,
+  applyMeteringCredits,
+  finalizeKiroUsage,
+  type KiroUsage,
+  resetKiroUsage,
+} from "./token-usage.js";
 import { countTokens } from "./tokenizer.js";
 import {
   buildHistory,
@@ -236,20 +243,29 @@ export function streamKiro(
     .AssistantMessageEventStream;
   const stream = new StreamCtor();
   (async () => {
+    // Held as `KiroUsage` (pi's `Usage` plus Kiro-only figures) so the
+    // Kiro-specific fields are compiler-checked instead of being written
+    // through a cast. `output.usage` is the same object.
+    //
+    // cacheRead/cacheWrite start at 0 because pi's `Usage` requires numbers,
+    // but that 0 is a placeholder, not a measurement: until a turn reports
+    // cache counts, `usage.provenance.cache` stays absent so consumers can
+    // tell "no cache hits" apart from "the service never said".
+    const usage: KiroUsage = {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    };
     const output: AssistantMessage = {
       role: "assistant",
       content: [],
       api: model.api,
       provider: model.provider,
       model: model.id,
-      usage: {
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        totalTokens: 0,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-      },
+      usage,
       stopReason: "stop",
       timestamp: Date.now(),
     };
@@ -775,6 +791,9 @@ export function streamKiro(
         let totalContent = "";
         let lastContentData = "";
         let usageEvent: KiroUsageData | null = null;
+        // `usage` outlives this loop; clear whatever a previous attempt reported
+        // so a failed attempt's counts cannot survive into this one.
+        resetKiroUsage(usage);
         let receivedContextUsage = false;
         const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
         let nativeThinkingBlockIndex: number | null = null;
@@ -899,9 +918,10 @@ export function streamKiro(
           if (debugEnabled()) debugLog("stream.events", [event]);
           switch (event.type) {
             case "contextUsage": {
-              const pct = event.data.contextUsagePercentage;
-              output.usage.input = Math.round((pct / 100) * model.contextWindow);
-              (output.usage as unknown as Record<string, unknown>).contextPercent = pct;
+              // Provisional only: this arrives long before metadataEvent, so it
+              // keeps live context% moving mid-turn. The input count it derives
+              // is superseded by the measured one in finalizeKiroUsage().
+              applyContextUsage(usage, event.data.contextUsagePercentage, model.contextWindow);
               receivedContextUsage = true;
               break;
             }
@@ -973,8 +993,10 @@ export function streamKiro(
               break;
             }
             case "metering": {
-              // MeteringEvent.usage counts credits, not tokens. Recorded for
-              // observability only; never folded into token accounting.
+              // MeteringEvent.usage counts credits, not tokens. Recorded as its
+              // own field so the actual billing unit is observable; never folded
+              // into token accounting or into Usage.cost.
+              applyMeteringCredits(usage, event.data.credits, event.data.unitPlural ?? event.data.unit);
               if (debugEnabled()) debugLog("stream.metering", [event.data]);
               break;
             }
@@ -1075,33 +1097,28 @@ export function streamKiro(
             content: (output.content[textBlockIndex] as TextContent).text,
             partial: output,
           });
-        // The Kiro streaming API does not reliably emit per-response output
-        // token counts (unlike Anthropic's `output_tokens` or Bedrock's
-        // `usage.outputTokens`). When the `usage` event is missing or only
-        // reports `inputTokens`, fall back to a tiktoken estimate over
-        // everything the assistant emitted — text plus tool-call input JSON
-        // (accumulated into `totalContent` above). Otherwise tool-call-only
-        // turns report 0 output tokens and break consumers like the TPS
-        // extension that watch `usage.output`.
+        // Fold in whatever `metadataEvent.tokenUsage` reported.
         //
         // `KiroUsageData.inputTokens` is `TokenUsage.uncachedInputTokens` — the
         // input billed at full rate, NOT total input. pi's `usage.input` is the
         // same uncached slot, with `cacheRead`/`cacheWrite` as siblings, and
-        // `calculateCost` prices all three separately. So the cache counts must
-        // land whenever `input` is taken from the wire; otherwise a cached turn
+        // `calculateCost` prices all three separately, so the cache counts must
+        // land whenever `input` comes from the wire; otherwise a cached turn
         // reports a fraction of its real input and is priced far too low.
-        if (usageEvent?.inputTokens !== undefined) output.usage.input = usageEvent.inputTokens;
-        if (usageEvent?.cacheReadInputTokens !== undefined) output.usage.cacheRead = usageEvent.cacheReadInputTokens;
-        if (usageEvent?.cacheWriteInputTokens !== undefined) output.usage.cacheWrite = usageEvent.cacheWriteInputTokens;
-        output.usage.output = usageEvent?.outputTokens ?? countTokens(totalContent);
+        //
         // `TokenUsage.totalTokens` is required on the wire while the cache counts
-        // are optional, so the service's own total is the authoritative figure —
-        // recomputing from components silently under-reports whenever a component
-        // is omitted. Prefer it and fall back to the sum, matching how pi's
-        // bedrock adapter treats the one other wire that supplies a total.
-        output.usage.totalTokens =
-          usageEvent?.totalTokens ??
-          output.usage.input + output.usage.cacheRead + output.usage.cacheWrite + output.usage.output;
+        // are optional, so the service's own total is authoritative — recomputing
+        // from components under-reports whenever one is omitted.
+        //
+        // finalizeKiroUsage() owns all of that, plus the measured > derived >
+        // estimated precedence and the slot normalization that keeps
+        // input/cacheRead/cacheWrite disjoint. The tiktoken estimate over
+        // everything the assistant emitted (text plus tool-call input JSON,
+        // accumulated into `totalContent`) fills only the figures the wire
+        // omitted: Kiro does not reliably send `outputTokens`, and a
+        // tool-call-only turn reporting 0 output breaks consumers that watch
+        // `usage.output`, such as the TPS extension.
+        finalizeKiroUsage(usage, usageEvent, () => countTokens(totalContent));
         try {
           PiAi.calculateCost(model, output.usage);
         } catch {

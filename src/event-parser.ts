@@ -43,6 +43,8 @@ export type KiroUsageData = {
   cacheReadInputTokens?: number;
   cacheWriteInputTokens?: number;
   contextUsagePercentage?: number;
+  /** `TokenUsage.normalizedTokenUsage` — the MPS credit basis, not a token count. */
+  normalizedTokenUsage?: number;
   /** `MetadataEvent.stopReason`, passed through verbatim. */
   rawStopReason?: string;
   /** `MetadataEvent.stopDetails`, passed through verbatim. */
@@ -121,6 +123,7 @@ function parseMetadata(parsed: Record<string, unknown>): KiroStreamEvent | null 
     cacheReadInputTokens: num(tu.cacheReadInputTokens),
     cacheWriteInputTokens: num(tu.cacheWriteInputTokens),
     contextUsagePercentage: num(tu.contextUsagePercentage),
+    normalizedTokenUsage: num(tu.normalizedTokenUsage),
     rawStopReason: str(parsed.stopReason),
     stopDetails:
       parsed.stopDetails && typeof parsed.stopDetails === "object"
