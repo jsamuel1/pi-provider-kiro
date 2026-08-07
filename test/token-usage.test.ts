@@ -77,7 +77,7 @@ describe("applyContextUsage", () => {
 describe("applyMeteringCredits", () => {
   it("records credits and unit without touching token counts", () => {
     const usage = freshUsage();
-    applyMeteringCredits(usage, 3, "credits");
+    applyMeteringCredits(usage, 3, "credit", "credits");
 
     expect(usage.credits).toBe(3);
     expect(usage.creditUnit).toBe("credits");
@@ -86,16 +86,36 @@ describe("applyMeteringCredits", () => {
     expect(usage.totalTokens).toBe(0);
   });
 
+  it("picks the singular unit for a single credit", () => {
+    const usage = freshUsage();
+    applyMeteringCredits(usage, 1, "credit", "credits");
+
+    // Storing unitPlural unconditionally would render "1 credits".
+    expect(usage.creditUnit).toBe("credit");
+  });
+
   it("records an explicit zero credit charge", () => {
     const usage = freshUsage();
-    applyMeteringCredits(usage, 0, "credit");
+    applyMeteringCredits(usage, 0, "credit", "credits");
 
     expect(usage.credits).toBe(0);
+    // Zero takes the plural, as English does.
+    expect(usage.creditUnit).toBe("credits");
+  });
+
+  it("uses whichever form the event supplied when only one is present", () => {
+    const pluralOnly = freshUsage();
+    applyMeteringCredits(pluralOnly, 1, undefined, "credits");
+    expect(pluralOnly.creditUnit).toBe("credits");
+
+    const singularOnly = freshUsage();
+    applyMeteringCredits(singularOnly, 4, "credit", undefined);
+    expect(singularOnly.creditUnit).toBe("credit");
   });
 
   it("leaves credits absent when the event carried none", () => {
     const usage = freshUsage();
-    applyMeteringCredits(usage, undefined, undefined);
+    applyMeteringCredits(usage, undefined, undefined, undefined);
 
     expect(usage.credits).toBeUndefined();
     expect(usage.creditUnit).toBeUndefined();
@@ -318,7 +338,7 @@ describe("finalizeKiroUsage", () => {
 
   it("carries normalizedTokenUsage and metering credits together", () => {
     const usage = freshUsage();
-    applyMeteringCredits(usage, 2, "credits");
+    applyMeteringCredits(usage, 2, "credit", "credits");
     finalizeKiroUsage(usage, { inputTokens: 10, outputTokens: 5, normalizedTokenUsage: 0.25 }, neverEstimate);
 
     // Credits (MeteringEvent) and normalizedTokenUsage (TokenUsage) are the two
@@ -334,7 +354,7 @@ describe("resetKiroUsage", () => {
     const usage = freshUsage();
     usage.cost = { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 };
     applyContextUsage(usage, 50, CONTEXT_WINDOW);
-    applyMeteringCredits(usage, 7, "credits");
+    applyMeteringCredits(usage, 7, "credit", "credits");
     finalizeKiroUsage(usage, fullWire(), neverEstimate);
 
     resetKiroUsage(usage);
@@ -353,7 +373,7 @@ describe("resetKiroUsage", () => {
     const usage = freshUsage();
     // Attempt 1: cache-warm turn, then the stream fails and is retried.
     finalizeKiroUsage(usage, fullWire(), neverEstimate);
-    applyMeteringCredits(usage, 9, "credits");
+    applyMeteringCredits(usage, 9, "credit", "credits");
     expect(usage.cacheRead).toBe(8_000);
 
     resetKiroUsage(usage);

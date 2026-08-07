@@ -995,8 +995,9 @@ export function streamKiro(
             case "metering": {
               // MeteringEvent.usage counts credits, not tokens. Recorded as its
               // own field so the actual billing unit is observable; never folded
-              // into token accounting or into Usage.cost.
-              applyMeteringCredits(usage, event.data.credits, event.data.unitPlural ?? event.data.unit);
+              // into token accounting or into Usage.cost. Both grammatical forms
+              // are passed through so the count picks the right one.
+              applyMeteringCredits(usage, event.data.credits, event.data.unit, event.data.unitPlural);
               if (debugEnabled()) debugLog("stream.metering", [event.data]);
               break;
             }

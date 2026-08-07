@@ -109,15 +109,25 @@ export function applyContextUsage(usage: KiroUsage, contextUsagePercentage: numb
   usage.provenance = { ...usage.provenance, input: "derived" };
 }
 
+const nonEmpty = (v: unknown): string | undefined => (typeof v === "string" && v.length > 0 ? v : undefined);
+
 /**
  * Record `MeteringEvent` credits.
  *
  * These are the units the account is actually billed in. They are not tokens
  * and must never be folded into token counts or into `Usage.cost`.
+ *
+ * `MeteringEvent` supplies both grammatical forms (`unit`/`unitPlural`), so the
+ * one that agrees with the count is selected here rather than at the call site:
+ * storing `unitPlural` unconditionally renders "1 credits". Zero takes the
+ * plural, as English does. Either form alone is used as-is.
  */
-export function applyMeteringCredits(usage: KiroUsage, credits?: number, unit?: string): void {
+export function applyMeteringCredits(usage: KiroUsage, credits?: number, unit?: string, unitPlural?: string): void {
   if (isCount(credits)) usage.credits = credits;
-  if (typeof unit === "string" && unit.length > 0) usage.creditUnit = unit;
+  const singular = nonEmpty(unit);
+  const plural = nonEmpty(unitPlural);
+  const preferred = credits === 1 ? (singular ?? plural) : (plural ?? singular);
+  if (preferred !== undefined) usage.creditUnit = preferred;
 }
 
 /**

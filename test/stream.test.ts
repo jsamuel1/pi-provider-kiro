@@ -3805,6 +3805,30 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
+  it("records the singular credit unit for a one-credit turn", async () => {
+    const mockFetch = mockFetchChunked([
+      '{"content":"Hello"}',
+      // Both grammatical forms are on the wire; the count selects one. Passing
+      // only unitPlural through would render "1 credits".
+      '{"usage":1,"unit":"credit","unitPlural":"credits"}',
+      JSON.stringify({ tokenUsage: { uncachedInputTokens: 10, outputTokens: 5, totalTokens: 15 } }),
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg).toBeDefined();
+    if (!msg) throw new Error("Expected a completed assistant message");
+    const usage = msg.usage as KiroUsage;
+
+    expect(usage.credits).toBe(1);
+    expect(usage.creditUnit).toBe("credit");
+
+    vi.unstubAllGlobals();
+  });
+
   it("leaves cache provenance absent when no metadataEvent arrives", async () => {
     const mockFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');
     vi.stubGlobal("fetch", mockFetch);
