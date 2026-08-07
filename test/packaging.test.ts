@@ -21,20 +21,33 @@ const pkg = JSON.parse(readFileSync(`${repoRoot}package.json`, "utf8")) as {
 // able to introduce an undeclared host import without failing this test.
 const SRC_FILES = readdirSync(`${repoRoot}src`).filter((f) => f.endsWith(".ts"));
 
+const HOST_SCOPE = "@earendil-works/";
+
 /**
  * `import type` is erased at compile time, so it creates no runtime resolution
  * requirement. Anything else does.
+ *
+ * Matches every import statement regardless of specifier, then filters to host
+ * packages. Anchoring the pattern on the host scope instead would let a single
+ * match straddle statements — its clause may swallow a later `import` — so a
+ * leading `import type { X } from "./local.js"` would hide the host value
+ * import beneath it, and a leading value import would falsely mark a host
+ * type-only import as a runtime one.
  */
 function runtimeHostImports(source: string): string[] {
   const found = new Set<string>();
-  for (const match of source.matchAll(/import\s+(type\s+)?([\s\S]*?)from\s+"(@earendil-works\/[^"]+)"/g)) {
+  for (const match of source.matchAll(/\bimport\s+(type\s+)?([\s\S]*?)\bfrom\s+"([^"]+)"/g)) {
     const [, typeOnlyKeyword, clause, specifier] = match;
-    if (typeOnlyKeyword) continue;
+    if (!specifier.startsWith(HOST_SCOPE) || typeOnlyKeyword) continue;
     // `import { type Api, clampThinkingLevel }` still emits a runtime import;
     // `import { type Api, type Model }` does not.
     const bindings = clause.replace(/[{}]/g, "").split(",");
     const hasValueBinding = bindings.some((b) => b.trim().length > 0 && !b.trim().startsWith("type "));
     if (hasValueBinding || !clause.includes("{")) found.add(specifier);
+  }
+  // Side-effect imports have no clause to inspect and are always runtime.
+  for (const [, specifier] of source.matchAll(/\bimport\s+"([^"]+)"/g)) {
+    if (specifier.startsWith(HOST_SCOPE)) found.add(specifier);
   }
   return [...found];
 }
@@ -90,5 +103,39 @@ describe("runtimeHostImports", () => {
       "@earendil-works/pi-ai",
     ]);
     expect(runtimeHostImports('import * as PiAi from "@earendil-works/pi-ai";')).toEqual(["@earendil-works/pi-ai"]);
+  });
+
+  // The guard exists to fail when a new source file imports an undeclared host
+  // package, so a preceding statement must not be able to hide one.
+  it("detects a host value import beneath a type-only import of another module", () => {
+    const source = ['import type { Foo } from "./foo.js";', 'import { Container } from "@earendil-works/pi-tui";'].join(
+      "\n",
+    );
+    expect(runtimeHostImports(source)).toEqual(["@earendil-works/pi-tui"]);
+  });
+
+  it("detects a multi-line host value import beneath other statements", () => {
+    const source = [
+      'import { readFileSync } from "node:fs";',
+      "import {",
+      "  type Api,",
+      "  clampThinkingLevel,",
+      '} from "@earendil-works/pi-ai";',
+    ].join("\n");
+    expect(runtimeHostImports(source)).toEqual(["@earendil-works/pi-ai"]);
+  });
+
+  it("detects bare side-effect host imports", () => {
+    expect(runtimeHostImports('import "@earendil-works/pi-tui";\nimport { readFileSync } from "node:fs";')).toEqual([
+      "@earendil-works/pi-tui",
+    ]);
+  });
+
+  it("ignores a host type-only import beneath a value import of another module", () => {
+    const source = [
+      'import { readFileSync } from "node:fs";',
+      'import type { Api } from "@earendil-works/pi-ai";',
+    ].join("\n");
+    expect(runtimeHostImports(source)).toEqual([]);
   });
 });
