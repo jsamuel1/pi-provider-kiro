@@ -100,7 +100,9 @@ isNonRetryableBodyError(body); // hard quota → do not retry
 ```
 
 These are Kiro's own codes, not a provider taxonomy: mapping them to your own
-semantics is the consumer's job.
+semantics is the consumer's job. The entry point also imports pi's host packages
+(`@earendil-works/pi-ai` and friends), which are already present wherever this
+extension runs.
 
 ## Development
 
