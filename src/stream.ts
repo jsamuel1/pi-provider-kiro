@@ -994,6 +994,14 @@ export function streamKiro(
           if (retryCount < maxRetries) {
             retryCount++;
             const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY);
+            // `output` is created once outside the retry loop, so anything the
+            // aborted attempt already appended survives into the next one. A
+            // typed error frame (throttling/validation/serviceUnavailable) can
+            // arrive after partial text, which would otherwise concatenate the
+            // abandoned prefix onto the retried response. The empty-response
+            // retry below resets for the same reason. `textBlockIndex` and the
+            // tool-call state are per-iteration and need no reset here.
+            output.content = [];
             await abortableDelay(delayMs, options?.signal);
             continue;
           }
