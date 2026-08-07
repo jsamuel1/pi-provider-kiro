@@ -144,6 +144,38 @@ describe("applyMeteringCredits", () => {
     expect(usage.credits).toBe(4);
     expect(usage.creditUnit).toBe("credits");
   });
+
+  it("singularizes when the count arrives in a frame after the unit strings", () => {
+    const usage = freshUsage();
+    // The mirror image of the case above: `MeteringEvent.usage` is optional, so a
+    // units-only frame can precede the count. With no count to agree with its
+    // choice is provisional, and must be revisited once the count lands —
+    // otherwise the provisional plural sticks and renders "1 credits".
+    applyMeteringCredits(usage, undefined, "credit", "credits");
+    expect(usage.creditUnit).toBe("credits");
+
+    applyMeteringCredits(usage, 1, undefined, undefined);
+
+    expect(usage.credits).toBe(1);
+    expect(usage.creditUnit).toBe("credit");
+  });
+
+  it("keeps the plural when a later count is not one", () => {
+    const usage = freshUsage();
+    applyMeteringCredits(usage, undefined, "credit", "credits");
+    applyMeteringCredits(usage, 6, undefined, undefined);
+
+    expect(usage.creditUnit).toBe("credits");
+  });
+
+  it("remembers a single form supplied by an earlier frame", () => {
+    const usage = freshUsage();
+    // Only the singular was ever sent, so it stays in use whatever the count.
+    applyMeteringCredits(usage, undefined, "credit", undefined);
+    applyMeteringCredits(usage, 3, undefined, undefined);
+
+    expect(usage.creditUnit).toBe("credit");
+  });
 });
 
 describe("finalizeKiroUsage", () => {
@@ -397,6 +429,20 @@ describe("resetKiroUsage", () => {
       totalTokens: 0,
       cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 },
     });
+  });
+
+  it("clears the retained unit forms so a later count cannot revive them", () => {
+    const usage = freshUsage();
+    applyMeteringCredits(usage, 4, "credit", "credits");
+
+    resetKiroUsage(usage);
+    // A retry that reports only a count must not inherit the previous attempt's
+    // unit strings.
+    applyMeteringCredits(usage, 1, undefined, undefined);
+
+    expect(usage.credits).toBe(1);
+    expect(usage.creditUnit).toBeUndefined();
+    expect(usage.creditUnitForms).toBeUndefined();
   });
 
   it("stops a failed attempt's cache counts leaking into a clean retry", () => {

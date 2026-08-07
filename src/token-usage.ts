@@ -64,6 +64,12 @@ export type KiroUsage = Usage & {
   credits?: number;
   /** Display unit for {@link credits}, e.g. "credit"/"credits". */
   creditUnit?: string;
+  /**
+   * Both grammatical forms `MeteringEvent` supplied, retained so {@link
+   * creditUnit} can be re-decided when a later frame revises the count.
+   * Diagnostics should read {@link creditUnit}, not this.
+   */
+  creditUnitForms?: { singular?: string; plural?: string };
   provenance?: KiroUsageProvenance;
 };
 
@@ -88,6 +94,7 @@ export function resetKiroUsage(usage: KiroUsage): void {
   delete usage.normalizedTokenUsage;
   delete usage.credits;
   delete usage.creditUnit;
+  delete usage.creditUnitForms;
   delete usage.provenance;
 }
 
@@ -131,15 +138,30 @@ const nonEmpty = (v: unknown): string | undefined => (typeof v === "string" && v
  * storing `unitPlural` unconditionally renders "1 credits". Zero takes the
  * plural, as English does. Either form alone is used as-is.
  *
- * Agreement is decided against the count now held on `usage`, not against this
- * call's `credits` argument. Every `MetadataEvent`/`MeteringEvent` field is
- * optional, so a later frame can carry the unit strings while omitting `usage`;
- * reading the argument would then re-pluralize an already-recorded count of 1.
+ * Every `MeteringEvent` field is optional (see the generated `MeteringEvent`:
+ * `usage`, `unit` and `unitPlural` are all optional), so the count and the unit
+ * strings can arrive in either order, in separate frames:
+ *
+ *   - units then count — the units frame has no count to agree with, so its
+ *     choice is provisional and must be revisited once the count lands.
+ *   - count then units — the units frame carries no count, so agreement must be
+ *     decided against the count already recorded, not this call's argument.
+ *
+ * Both are handled by keeping the forms themselves on `usage` and re-deciding
+ * agreement from scratch on every frame. Deciding once per frame from only that
+ * frame's fields renders "1 credits" in whichever order is not special-cased.
  */
 export function applyMeteringCredits(usage: KiroUsage, credits?: number, unit?: string, unitPlural?: string): void {
   if (isCount(credits)) usage.credits = credits;
-  const singular = nonEmpty(unit);
-  const plural = nonEmpty(unitPlural);
+
+  const singular = nonEmpty(unit) ?? usage.creditUnitForms?.singular;
+  const plural = nonEmpty(unitPlural) ?? usage.creditUnitForms?.plural;
+  if (singular === undefined && plural === undefined) return;
+  usage.creditUnitForms = { ...(singular !== undefined && { singular }), ...(plural !== undefined && { plural }) };
+
+  // Re-decided against the count now held on `usage`, so a count arriving in a
+  // later frame corrects a provisionally-plural unit. An unknown count takes the
+  // plural, matching the zero case.
   const preferred = usage.credits === 1 ? (singular ?? plural) : (plural ?? singular);
   if (preferred !== undefined) usage.creditUnit = preferred;
 }

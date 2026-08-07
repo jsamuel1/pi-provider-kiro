@@ -3829,6 +3829,47 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
+  it("singularizes the credit unit when the count arrives in a later metering frame", async () => {
+    // Every MeteringEvent field is optional, so the unit strings can arrive before
+    // the count. The units frame has no count to agree with, so its plural choice
+    // is provisional and must be revised once the count lands. Framed with an
+    // explicit key because a units-only payload has no numeric `usage` for the
+    // fixture helper to infer `meteringEvent` from — on the wire the union member
+    // comes from the `:event-type` header, not the payload shape.
+    const body = concatMessages(
+      encodeEventMessage({ content: "Hello" }),
+      encodeEventMessage({ unit: "credit", unitPlural: "credits" }, "meteringEvent"),
+      encodeEventMessage({ usage: 1 }, "meteringEvent"),
+      encodeEventMessage({ tokenUsage: { uncachedInputTokens: 10, outputTokens: 5, totalTokens: 15 } }),
+    );
+    const mockFetch = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({ done: false, value: body })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          releaseLock: () => {},
+        }),
+      },
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg).toBeDefined();
+    if (!msg) throw new Error("Expected a completed assistant message");
+    const usage = msg.usage as KiroUsage;
+
+    expect(usage.credits).toBe(1);
+    expect(usage.creditUnit).toBe("credit");
+
+    vi.unstubAllGlobals();
+  });
+
   it("leaves cache provenance absent when no metadataEvent arrives", async () => {
     const mockFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');
     vi.stubGlobal("fetch", mockFetch);
