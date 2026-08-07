@@ -3612,10 +3612,12 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
-  it("prefers usage event values over tiktoken when available", async () => {
+  it("prefers metadataEvent token usage over tiktoken when available", async () => {
     const mockFetch = mockFetchChunked([
       '{"content":"Hello"}',
-      '{"usage":{"inputTokens":500,"outputTokens":200}}',
+      // MetadataEvent shape from ChatResponseStream: token counts live under
+      // tokenUsage.uncachedInputTokens/outputTokens, not a top-level `usage`.
+      '{"tokenUsage":{"uncachedInputTokens":500,"outputTokens":200,"totalTokens":700}}',
       '{"contextUsagePercentage":10}',
     ]);
     vi.stubGlobal("fetch", mockFetch);

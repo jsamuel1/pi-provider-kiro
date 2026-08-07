@@ -28,7 +28,7 @@ import {
   type KiroAdditionalModelRequestFields,
 } from "./effort.js";
 import { getKiroEndpoints, getKiroRegionFromEndpoint } from "./endpoints.js";
-import { parseKiroEvent } from "./event-parser.js";
+import { type KiroUsageData, parseKiroEvent } from "./event-parser.js";
 import {
   addPlaceholderTools,
   assertHistoryWithinLimit,
@@ -774,7 +774,7 @@ export function streamKiro(
         const bodyReader = (response.body as unknown as ReadableStream<Uint8Array>).getReader();
         let totalContent = "";
         let lastContentData = "";
-        let usageEvent: { inputTokens?: number; outputTokens?: number } | null = null;
+        let usageEvent: KiroUsageData | null = null;
         let receivedContextUsage = false;
         const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
         let nativeThinkingBlockIndex: number | null = null;
@@ -884,9 +884,18 @@ export function streamKiro(
           const { done, value } = iterResult;
           if (done) break;
           resetIdle();
-          const eventPayload = Object.values(value as Record<string, unknown>)[0] as Record<string, unknown>;
-          const event = parseKiroEvent(eventPayload);
+          // The marshaller keys each frame by its modeled `ChatResponseStream`
+          // union member (from the `:event-type` header). Route on that key
+          // instead of guessing the member from which fields are populated.
+          const frameEntry = Object.entries(value as Record<string, unknown>)[0];
+          if (!frameEntry) continue;
+          const [frameKey, framePayload] = frameEntry;
+          const event = parseKiroEvent(frameKey, (framePayload ?? {}) as Record<string, unknown>);
           if (!event) continue;
+          if (event.type === "ignored") {
+            if (debugEnabled()) debugLog("stream.events.ignored", [event.data.key]);
+            continue;
+          }
           if (debugEnabled()) debugLog("stream.events", [event]);
           switch (event.type) {
             case "contextUsage": {
@@ -957,6 +966,12 @@ export function streamKiro(
             }
             case "usage": {
               usageEvent = event.data;
+              break;
+            }
+            case "metering": {
+              // MeteringEvent.usage counts credits, not tokens. Recorded for
+              // observability only; never folded into token accounting.
+              if (debugEnabled()) debugLog("stream.metering", [event.data]);
               break;
             }
             case "error": {
