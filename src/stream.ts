@@ -1086,7 +1086,13 @@ export function streamKiro(
         if (usageEvent?.cacheReadInputTokens !== undefined) output.usage.cacheRead = usageEvent.cacheReadInputTokens;
         if (usageEvent?.cacheWriteInputTokens !== undefined) output.usage.cacheWrite = usageEvent.cacheWriteInputTokens;
         output.usage.output = usageEvent?.outputTokens ?? countTokens(totalContent);
+        // `TokenUsage.totalTokens` is required on the wire while the cache counts
+        // are optional, so the service's own total is the authoritative figure —
+        // recomputing from components silently under-reports whenever a component
+        // is omitted. Prefer it and fall back to the sum, matching how pi's
+        // bedrock adapter treats the one other wire that supplies a total.
         output.usage.totalTokens =
+          usageEvent?.totalTokens ??
           output.usage.input + output.usage.cacheRead + output.usage.cacheWrite + output.usage.output;
         try {
           PiAi.calculateCost(model, output.usage);

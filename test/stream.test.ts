@@ -3668,6 +3668,31 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
+  it("keeps the wire totalTokens when the service omits an optional cache count", async () => {
+    // TokenUsage.totalTokens is required on the wire; cacheReadInputTokens and
+    // cacheWriteInputTokens are optional. Recomputing the total from components
+    // would report 250 for a turn the service says cost 50250 context tokens,
+    // and calculateContextTokens drives the context gauge from that total.
+    const mockFetch = mockFetchChunked([
+      '{"content":"Hello"}',
+      '{"tokenUsage":{"uncachedInputTokens":200,"outputTokens":50,"totalTokens":50250}}',
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg).toBeDefined();
+    if (!msg) throw new Error("Expected a completed assistant message");
+
+    expect(msg.usage.input).toBe(200);
+    expect(msg.usage.cacheRead).toBe(0);
+    expect(msg.usage.totalTokens).toBe(50250);
+
+    vi.unstubAllGlobals();
+  });
+
   it("merges metadataEvent frames so a later stopReason frame cannot erase token counts", async () => {
     // Every MetadataEvent field is optional; tokenUsage and stopReason may
     // arrive in separate frames.
