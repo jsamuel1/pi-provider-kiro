@@ -260,8 +260,13 @@ describe("Feature 8: Stream Event Parsing", () => {
   });
 
   describe("parseKiroEventByShape — fail-open fallback", () => {
-    it("is used for unkeyed frames so unknown members degrade gracefully", () => {
-      expect(parseKiroEvent("$unknown", { content: "hi" })).toEqual({ type: "content", data: "hi" });
+    it("is used for a member name this client does not know yet", () => {
+      // The reachable case: the service adds a member, so the frame carries a
+      // real `:event-type` this build has never seen. A literal `$unknown`
+      // event frame does NOT reach the parser — the Smithy marshaller drops any
+      // event frame whose deserialized result has a `$unknown` property, and the
+      // deserializer keys its result by the header value.
+      expect(parseKiroEvent("brandNewEvent", { content: "hi" })).toEqual({ type: "content", data: "hi" });
     });
 
     it("recognizes followupPrompt, which has no modeled union member", () => {

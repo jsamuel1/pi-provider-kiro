@@ -15,7 +15,12 @@ import { validateKiroConversation, validateKiroToolStructure } from "../src/hist
 import { capacityRetryConfig, retryConfig } from "../src/retry.js";
 import { resetProfileArnCache, streamKiro } from "../src/stream.js";
 import { EMPTY_CONTENT_PLACEHOLDER, type KiroHistoryEntry } from "../src/transform.js";
-import { concatMessages, encodeEventMessage, encodeExceptionMessage } from "./helpers/event-stream.js";
+import {
+  concatMessages,
+  encodeEventMessage,
+  encodeExceptionMessage,
+  encodeRawExceptionMessage,
+} from "./helpers/event-stream.js";
 import { RECORD_279_COMMAND, RECORD_279_SUMMARY, RECORD_279_TEXT } from "./helpers/invoke-fixture.js";
 
 const ts = Date.now();
@@ -3808,6 +3813,40 @@ describe("Feature 9: Streaming Integration", () => {
     const error = events.find((e) => e.type === "error");
     expect(error?.type === "error" && error.error.errorMessage).toContain("ServiceUnavailableException");
     expect(error?.type === "error" && error.error.errorMessage).toContain("capacity exhausted");
+
+    vi.unstubAllGlobals();
+  }, 30000);
+
+  it("keeps the exception-type name when the member is not one this client models", async () => {
+    // Smithy's own raw-body fallback only fires when the deserializer returns a
+    // `$unknown` property, which this one never does, so an unmodeled member
+    // would otherwise be thrown as the bare parsed object and reach the caller
+    // as `{"message":"..."}` with the member name gone — the same class loss
+    // this card removes for the four modeled members.
+    const mockFetch = vi.fn().mockImplementation(async () => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({
+              done: false,
+              value: encodeRawExceptionMessage("quotaExceededError", { message: "monthly quota gone" }),
+            })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          cancel: vi.fn().mockResolvedValue(undefined),
+          releaseLock: () => {},
+        }),
+      },
+    }));
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const error = events.find((e) => e.type === "error");
+    expect(error?.type === "error" && error.error.errorMessage).toContain("quotaExceededError");
+    expect(error?.type === "error" && error.error.errorMessage).toContain("monthly quota gone");
 
     vi.unstubAllGlobals();
   }, 30000);

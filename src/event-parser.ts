@@ -182,8 +182,14 @@ function parseError(
  * Route a decoded stream frame by its modeled `:event-type` key.
  *
  * `key` is the `ChatResponseStream` union member name from the frame header.
- * Unknown or missing keys fall back to {@link parseKiroEventByShape} so new
- * server-side members degrade instead of breaking the stream.
+ * An unrecognized key falls back to {@link parseKiroEventByShape} so a member
+ * added server-side degrades instead of breaking the stream.
+ *
+ * Note: a frame whose `:event-type` is the literal `$unknown` never reaches
+ * here. The Smithy marshaller drops any event frame for which the deserializer
+ * returns a `$unknown` property, and the deserializer keys its result by the
+ * header value, so `$unknown` is discarded one layer up. The fallback below is
+ * therefore reached only by a real, unrecognized member name.
  */
 export function parseKiroEvent(key: string, parsed: Record<string, unknown>): KiroStreamEvent | null {
   switch (key) {
@@ -238,8 +244,11 @@ export function parseKiroEvent(key: string, parsed: Record<string, unknown>): Ki
  *
  * The Smithy marshaller throws whatever the deserializer returns for that key,
  * so this is the only place the modeled exception class, `reason`, and
- * `retryAfterMilliseconds` are still structured. Unknown keys yield `null` so
- * the caller can fall back to the raw body.
+ * `retryAfterMilliseconds` are still structured. Returns `null` for a member
+ * that is not one of the four modeled errors; the caller is responsible for
+ * still preserving that member's name (see `src/stream.ts`), because Smithy's
+ * own raw-body fallback only fires for a `$unknown` result this deserializer
+ * never produces.
  */
 export function parseKiroExceptionFrame(key: string, parsed: Record<string, unknown>): KiroErrorData | null {
   const member = KIRO_ERROR_MEMBERS[key];
@@ -249,10 +258,10 @@ export function parseKiroExceptionFrame(key: string, parsed: Record<string, unkn
 }
 
 /**
- * Fail-open fallback for `$unknown` / unkeyed frames.
+ * Fail-open fallback for frames carrying an unrecognized `:event-type`.
  *
- * Order-dependent field sniffing. Only reachable when the frame carries no
- * recognizable `:event-type`; modeled frames never reach here.
+ * Order-dependent field sniffing. Only reachable when the frame's key is not a
+ * known `ChatResponseStream` member; modeled frames never reach here.
  */
 export function parseKiroEventByShape(parsed: Record<string, unknown>): KiroStreamEvent | null {
   if (parsed.content !== undefined) return { type: "content", data: parsed.content as string };

@@ -36,6 +36,11 @@ export function inferEventKey(payload: Record<string, unknown>): KiroEventKey | 
  * explicitly to exercise a specific union member (including error members,
  * which share field names with each other).
  *
+ * Passing `"$unknown"` produces a frame the Smithy marshaller DROPS: it skips
+ * any event frame whose deserialized result carries a `$unknown` property, and
+ * the deserializer in `src/stream.ts` keys its result by this header value. Use
+ * a real member name for anything that must reach the parser.
+ *
  * Note: the four error members target `@error` shapes, so the service frames
  * them as `:message-type: exception`. Use {@link encodeExceptionMessage} for
  * those; this function is for ordinary `event` frames.
@@ -66,6 +71,17 @@ export function encodeExceptionMessage(exceptionType: KiroEventKey, payload: obj
   if (!isKiroEventKey(exceptionType)) {
     throw new Error(`Not a ChatResponseStream member: ${exceptionType}`);
   }
+  return encodeRawExceptionMessage(exceptionType, payload);
+}
+
+/**
+ * Encode an exception frame for a member name this client does not model.
+ *
+ * Deliberately skips the `KIRO_EVENT_KEYS` guard so tests can exercise the
+ * unmodeled-member path — a fifth error member added server-side, which must
+ * still surface its `:exception-type` name rather than a bare JSON body.
+ */
+export function encodeRawExceptionMessage(exceptionType: string, payload: object): Uint8Array {
   return codec.encode({
     headers: {
       ":exception-type": { type: "string", value: exceptionType },

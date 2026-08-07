@@ -877,13 +877,26 @@ export function streamKiro(
           // callback returns, so returning the bare payload would discard the
           // modeled class. Return an Error carrying the parsed detail instead.
           if (msg.headers[":message-type"]?.value === "exception") {
-            const data = parseKiroExceptionFrame(key, parsed);
-            if (data) {
-              const error = new Error(data.message ? `${data.error}: ${data.message}` : data.error);
-              error.name = data.error;
-              (error as Error & { kiroError?: KiroErrorData }).kiroError = data;
-              return { [key]: error } as Record<string, unknown>;
-            }
+            // An unmodeled member (a fifth error added server-side, or `$unknown`)
+            // still arrives keyed by `:exception-type`. Smithy's own fail-open path
+            // is unreachable here — it only triggers when the deserializer returns
+            // a `$unknown` property, which this one never does — so without a
+            // fallback the marshaller would throw the bare parsed body and the
+            // member name would be lost in exactly the way this routing exists to
+            // prevent. Synthesize the same typed shape with `kind: "unknown"`.
+            const data: KiroErrorData = parseKiroExceptionFrame(key, parsed) ?? {
+              error: key,
+              kind: "unknown",
+              ...(typeof parsed.message === "string" ? { message: parsed.message } : {}),
+              ...(typeof parsed.reason === "string" ? { reason: parsed.reason } : {}),
+              ...(typeof parsed.retryAfterMilliseconds === "number"
+                ? { retryAfterMilliseconds: parsed.retryAfterMilliseconds }
+                : {}),
+            };
+            const error = new Error(data.message ? `${data.error}: ${data.message}` : data.error);
+            error.name = data.error;
+            (error as Error & { kiroError?: KiroErrorData }).kiroError = data;
+            return { [key]: error } as Record<string, unknown>;
           }
           return { [key]: parsed } as Record<string, unknown>;
         });
