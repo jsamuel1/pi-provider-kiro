@@ -17,6 +17,20 @@ import { fetchKiroUsage } from "./usage.js";
 export { resolveApiRegion } from "./endpoints.js";
 export type { KiroStreamEvent } from "./event-parser.js";
 export { KIRO_MODEL_IDS, kiroModels, resolveKiroModel } from "./models.js";
+// Kiro's own error vocabulary and the predicates this provider classifies it
+// with. Published so consumers can interpret a reason code without an error
+// instance in hand (e.g. a persisted log line) instead of hardcoding copies of
+// the literals, which drift when the service adds a code.
+export type { KiroReasonCode } from "./retry.js";
+export {
+  CAPACITY_PATTERN,
+  isCapacityError,
+  isNonRetryableBodyError,
+  isTooBigError,
+  KIRO_REASON_CODES,
+  NON_RETRYABLE_BODY_PATTERNS,
+  TOO_BIG_PATTERNS,
+} from "./retry.js";
 export { streamKiro } from "./stream.js";
 
 /**
