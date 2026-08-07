@@ -412,7 +412,7 @@ describe("finalizeKiroUsage", () => {
 });
 
 describe("resetKiroUsage", () => {
-  it("clears everything one attempt reported, preserving cost", () => {
+  it("clears everything one attempt reported, cost included", () => {
     const usage = freshUsage();
     usage.cost = { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 };
     applyContextUsage(usage, 50, CONTEXT_WINDOW);
@@ -427,7 +427,11 @@ describe("resetKiroUsage", () => {
       cacheRead: 0,
       cacheWrite: 0,
       totalTokens: 0,
-      cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 },
+      // Cost is derived wholly from the counts above, so leaving it behind would
+      // leave the one figure nothing backs. A successful retry recomputes it;
+      // an attempt that never gets that far must not report the previous
+      // attempt's charge against these zeros.
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
     });
   });
 
@@ -443,6 +447,22 @@ describe("resetKiroUsage", () => {
     expect(usage.credits).toBe(1);
     expect(usage.creditUnit).toBeUndefined();
     expect(usage.creditUnitForms).toBeUndefined();
+  });
+
+  it("leaves no priced cost behind when the next attempt reports nothing", () => {
+    const usage = freshUsage();
+    // The empty-response/echo-loop retry is decided AFTER the turn has been
+    // finalized and priced, so a degenerate-but-priced attempt reaches here with
+    // a real charge on `cost`. If the retry then fails terminally, the errored
+    // turn is emitted with these zeroed counts — and must not still carry the
+    // abandoned attempt's charge.
+    finalizeKiroUsage(usage, fullWire(), neverEstimate);
+    usage.cost = { input: 0.3, output: 0.75, cacheRead: 0.0024, cacheWrite: 0, total: 1.0524 };
+
+    resetKiroUsage(usage);
+
+    expect(usage.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 });
+    expect(usage.totalTokens).toBe(0);
   });
 
   it("stops a failed attempt's cache counts leaking into a clean retry", () => {

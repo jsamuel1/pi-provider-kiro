@@ -76,13 +76,22 @@ export type KiroUsage = Usage & {
 const isCount = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0;
 
 /**
- * Clear everything a single stream attempt wrote, keeping `cost` intact.
+ * Clear everything a single stream attempt wrote, `cost` included.
  *
  * The `usage` object outlives the retry loop, but each attempt re-reports its
  * own counts. Without this reset a failed attempt's cache counts, credits,
  * `normalizedTokenUsage` and provenance would survive into a successful retry
  * that reported none of them — and stale cache legs would then be added into
  * the retry's recomputed `totalTokens`.
+ *
+ * `cost` is reset with them, because it is derived wholly from the counts being
+ * cleared and would otherwise be the one figure left unbacked by any of them.
+ * A successful attempt recomputes it via `PiAi.calculateCost`, so this only
+ * changes what a FAILED turn reports — and there it is the whole point. The
+ * empty-response/echo-loop retry runs after the turn has already been
+ * finalized and priced, so a degenerate-but-priced attempt followed by a
+ * terminal stream error would otherwise emit an error message carrying the
+ * abandoned attempt's charge against zeroed token counts.
  */
 export function resetKiroUsage(usage: KiroUsage): void {
   usage.input = 0;
@@ -90,6 +99,7 @@ export function resetKiroUsage(usage: KiroUsage): void {
   usage.cacheRead = 0;
   usage.cacheWrite = 0;
   usage.totalTokens = 0;
+  usage.cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
   delete usage.contextPercent;
   delete usage.normalizedTokenUsage;
   delete usage.credits;

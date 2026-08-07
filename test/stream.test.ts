@@ -3778,6 +3778,53 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
+  it("does not bill an errored turn for a priced attempt it abandoned", async () => {
+    // The empty-response/echo-loop retry is decided AFTER finalizeKiroUsage and
+    // PiAi.calculateCost have run, so attempt 1 here — degenerate (no text, no
+    // tool calls) but reporting real token counts — prices the turn before it is
+    // retried. The remaining attempts fail terminally, so the turn is emitted
+    // through the error path with the reset zeroed counts. Without cost in the
+    // reset, that error message carries attempt 1's charge against zero tokens:
+    // a priced turn with nothing backing the price.
+    const pricedDegenerate = encodeEventMessage({
+      tokenUsage: { uncachedInputTokens: 100_000, outputTokens: 50_000, totalTokens: 150_000 },
+    });
+    const failing = encodeEventMessage({ message: "capacity exhausted" }, "serviceUnavailableError");
+
+    const respond = (body: Uint8Array) => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({ done: false, value: body })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          cancel: vi.fn().mockResolvedValue(undefined),
+          releaseLock: () => {},
+        }),
+      },
+    });
+    const mockFetch = vi.fn().mockResolvedValueOnce(respond(pricedDegenerate)).mockResolvedValue(respond(failing));
+    vi.stubGlobal("fetch", mockFetch);
+
+    const priced = makeModel({ cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } });
+    const stream = streamKiro(priced, makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const error = events.find((e) => e.type === "error");
+    expect(error?.type).toBe("error");
+    if (error?.type !== "error") throw new Error("Expected an errored turn");
+    const usage = error.error.usage as KiroUsage;
+
+    expect(usage.totalTokens).toBe(0);
+    expect(usage.input).toBe(0);
+    expect(usage.output).toBe(0);
+    // Attempt 1 priced at ~1.05; none of it may survive onto this turn.
+    expect(usage.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 });
+
+    vi.unstubAllGlobals();
+  }, 30000);
+
   it("records meteringEvent credits without folding them into token counts", async () => {
     const mockFetch = mockFetchChunked([
       '{"content":"Hello"}',
