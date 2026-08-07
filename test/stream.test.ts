@@ -3974,6 +3974,16 @@ describe("Feature 9: Streaming Integration", () => {
     // post-loop, so an aborted attempt must contribute nothing to billing.
     // cacheRead is priced as its own line in calculateCost, so inheriting a
     // prior attempt's value would over-bill a turn that never read that cache.
+    //
+    // Priced deliberately: `makeModel()` defaults every rate to 0, so a
+    // `cost.*` assertion against the default model passes no matter what leaked
+    // across the retry boundary. Real per-million rates make these assertions
+    // able to fail at all. What actually holds this invariant is `usageEvent`'s
+    // loop scope, not the attempt-boundary reset — dropping the cache lines
+    // from `resetAttemptUsage` leaves this test green, because the aborted
+    // attempt errors before the post-stream cache writes ever run. The
+    // terminal-failure test below is what pins the reset itself.
+    const priced = makeModel({ cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } });
     let callCount = 0;
     const mockFetch = vi.fn().mockImplementation(async () => {
       callCount++;
@@ -4026,7 +4036,7 @@ describe("Feature 9: Streaming Integration", () => {
     });
     vi.stubGlobal("fetch", mockFetch);
 
-    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const stream = streamKiro(priced, makeContext(), { apiKey: "tok" });
     const events = await collect(stream);
     const done = events.find((e) => e.type === "done");
     const msg = done?.type === "done" ? done.message : undefined;
@@ -4039,9 +4049,94 @@ describe("Feature 9: Streaming Integration", () => {
     expect(msg.usage.cacheRead).toBe(0);
     expect(msg.usage.cacheWrite).toBe(0);
     expect(msg.usage.cost.cacheRead).toBe(0);
+    expect(msg.usage.cost.cacheWrite).toBe(0);
 
     vi.unstubAllGlobals();
   });
+
+  it("reports zero tokens and zero cost when a priced attempt is replaced by a terminally failing retry", async () => {
+    // The post-stream usage writes and `calculateCost` both run BEFORE the
+    // empty-response retry check, so a degenerate attempt that reported
+    // metadataEvent counts leaves a real priced charge on `output.usage.cost`.
+    // `output` outlives the retry loop. If the attempt-boundary reset cleared
+    // only the token counts and left `cost` alone, the terminal error would be
+    // emitted with totalTokens 0 and a stale non-zero charge — an invented bill
+    // for a turn that produced nothing.
+    const priced = makeModel({ cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } });
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(async () => {
+      callCount++;
+      if (callCount === 1) {
+        // Degenerate but expensive: large counts, no text, no tool calls. Gets
+        // priced, then triggers the empty-response retry.
+        return {
+          ok: true,
+          body: {
+            getReader: () => ({
+              read: vi
+                .fn()
+                .mockResolvedValueOnce({
+                  done: false,
+                  value: encodeEventMessage({
+                    tokenUsage: {
+                      uncachedInputTokens: 90000,
+                      outputTokens: 4000,
+                      totalTokens: 194000,
+                      cacheReadInputTokens: 100000,
+                      cacheWriteInputTokens: 0,
+                    },
+                  }),
+                })
+                .mockResolvedValueOnce({ done: true, value: undefined }),
+              cancel: vi.fn().mockResolvedValue(undefined),
+              releaseLock: () => {},
+            }),
+          },
+        };
+      }
+      // Every later attempt fails with a modeled exception frame, so the retry
+      // budget is exhausted and the turn ends in a terminal error.
+      return {
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: vi
+              .fn()
+              .mockResolvedValueOnce({
+                done: false,
+                value: encodeExceptionMessage("serviceUnavailableError", { message: "unavailable" }),
+              })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            cancel: vi.fn().mockResolvedValue(undefined),
+            releaseLock: () => {},
+          }),
+        },
+      };
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(priced, makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const error = events.find((e) => e.type === "error");
+    expect(error?.type).toBe("error");
+    if (error?.type !== "error") throw new Error("Expected a terminal error event");
+    expect(error.error.errorMessage).toContain("ServiceUnavailableException");
+
+    const usage = error.error.usage;
+    expect(usage.input).toBe(0);
+    expect(usage.output).toBe(0);
+    expect(usage.cacheRead).toBe(0);
+    expect(usage.cacheWrite).toBe(0);
+    expect(usage.totalTokens).toBe(0);
+    // The charge the abandoned attempt earned must be gone with its counts.
+    expect(usage.cost.input).toBe(0);
+    expect(usage.cost.output).toBe(0);
+    expect(usage.cost.cacheRead).toBe(0);
+    expect(usage.cost.cacheWrite).toBe(0);
+    expect(usage.cost.total).toBe(0);
+
+    vi.unstubAllGlobals();
+  }, 30000);
 
   it("does not inherit the failed attempt's contextUsage input when retrying", async () => {
     // `contextUsageEvent` writes `output.usage.input` and `contextPercent`
