@@ -965,7 +965,11 @@ export function streamKiro(
               break;
             }
             case "usage": {
-              usageEvent = event.data;
+              // Every MetadataEvent field is optional, so the service may split
+              // tokenUsage and stopReason/stopDetails across frames. Merge so a
+              // later partial frame cannot erase counts already received.
+              const prev: KiroUsageData = usageEvent ?? {};
+              usageEvent = { ...prev, ...event.data };
               break;
             }
             case "metering": {
@@ -1071,9 +1075,19 @@ export function streamKiro(
         // (accumulated into `totalContent` above). Otherwise tool-call-only
         // turns report 0 output tokens and break consumers like the TPS
         // extension that watch `usage.output`.
+        //
+        // `KiroUsageData.inputTokens` is `TokenUsage.uncachedInputTokens` — the
+        // input billed at full rate, NOT total input. pi's `usage.input` is the
+        // same uncached slot, with `cacheRead`/`cacheWrite` as siblings, and
+        // `calculateCost` prices all three separately. So the cache counts must
+        // land whenever `input` is taken from the wire; otherwise a cached turn
+        // reports a fraction of its real input and is priced far too low.
         if (usageEvent?.inputTokens !== undefined) output.usage.input = usageEvent.inputTokens;
+        if (usageEvent?.cacheReadInputTokens !== undefined) output.usage.cacheRead = usageEvent.cacheReadInputTokens;
+        if (usageEvent?.cacheWriteInputTokens !== undefined) output.usage.cacheWrite = usageEvent.cacheWriteInputTokens;
         output.usage.output = usageEvent?.outputTokens ?? countTokens(totalContent);
-        output.usage.totalTokens = output.usage.input + output.usage.output;
+        output.usage.totalTokens =
+          output.usage.input + output.usage.cacheRead + output.usage.cacheWrite + output.usage.output;
         try {
           PiAi.calculateCost(model, output.usage);
         } catch {

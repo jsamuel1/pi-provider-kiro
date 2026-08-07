@@ -3641,6 +3641,57 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
+  it("records cacheRead/cacheWrite so a cached turn is not priced as uncached input", async () => {
+    // TokenUsage.uncachedInputTokens excludes cache reads. Taking `input` from
+    // it while leaving cacheRead at 0 would report ~200 input tokens for a turn
+    // that actually read 50k cached tokens, and price it accordingly.
+    const mockFetch = mockFetchChunked([
+      '{"content":"Hello"}',
+      '{"tokenUsage":{"uncachedInputTokens":200,"outputTokens":50,"totalTokens":50250,"cacheReadInputTokens":50000,"cacheWriteInputTokens":0}}',
+      '{"contextUsagePercentage":5}',
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg).toBeDefined();
+    if (!msg) throw new Error("Expected a completed assistant message");
+
+    expect(msg.usage.input).toBe(200);
+    expect(msg.usage.cacheRead).toBe(50000);
+    expect(msg.usage.cacheWrite).toBe(0);
+    // input + cacheRead + cacheWrite + output, matching the wire totalTokens.
+    expect(msg.usage.totalTokens).toBe(50250);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("merges metadataEvent frames so a later stopReason frame cannot erase token counts", async () => {
+    // Every MetadataEvent field is optional; tokenUsage and stopReason may
+    // arrive in separate frames.
+    const mockFetch = mockFetchChunked([
+      '{"content":"Hello"}',
+      '{"tokenUsage":{"uncachedInputTokens":500,"outputTokens":200,"totalTokens":700}}',
+      '{"stopReason":"END_TURN"}',
+      '{"contextUsagePercentage":10}',
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg).toBeDefined();
+    if (!msg) throw new Error("Expected a completed assistant message");
+
+    expect(msg.usage.input).toBe(500);
+    expect(msg.usage.output).toBe(200);
+
+    vi.unstubAllGlobals();
+  });
+
   it("passes through contextPercent even without usage event", async () => {
     const mockFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":42}');
     vi.stubGlobal("fetch", mockFetch);
