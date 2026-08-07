@@ -1,0 +1,94 @@
+// ABOUTME: Guards the published package surface — entry fields and the pi host
+// ABOUTME: packages the bundle imports rather than bundling must stay declared.
+
+import { readdirSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
+
+const repoRoot = fileURLToPath(new URL("..", import.meta.url));
+
+const pkg = JSON.parse(readFileSync(`${repoRoot}package.json`, "utf8")) as {
+  main?: string;
+  types?: string;
+  files?: string[];
+  scripts: Record<string, string>;
+  peerDependencies?: Record<string, string>;
+  peerDependenciesMeta?: Record<string, { optional?: boolean }>;
+  pi?: { extensions?: string[] };
+};
+
+// Read from disk rather than a hardcoded list: a new source file must not be
+// able to introduce an undeclared host import without failing this test.
+const SRC_FILES = readdirSync(`${repoRoot}src`).filter((f) => f.endsWith(".ts"));
+
+/**
+ * `import type` is erased at compile time, so it creates no runtime resolution
+ * requirement. Anything else does.
+ */
+function runtimeHostImports(source: string): string[] {
+  const found = new Set<string>();
+  for (const match of source.matchAll(/import\s+(type\s+)?([\s\S]*?)from\s+"(@earendil-works\/[^"]+)"/g)) {
+    const [, typeOnlyKeyword, clause, specifier] = match;
+    if (typeOnlyKeyword) continue;
+    // `import { type Api, clampThinkingLevel }` still emits a runtime import;
+    // `import { type Api, type Model }` does not.
+    const bindings = clause.replace(/[{}]/g, "").split(",");
+    const hasValueBinding = bindings.some((b) => b.trim().length > 0 && !b.trim().startsWith("type "));
+    if (hasValueBinding || !clause.includes("{")) found.add(specifier);
+  }
+  return [...found];
+}
+
+describe("published package surface", () => {
+  // Without these a bare-specifier `import "pi-provider-kiro"` cannot resolve at
+  // all: Node falls back to the package root, which is not published.
+  it("publishes a resolvable entry point and types", () => {
+    expect(pkg.main).toBe("./dist/index.js");
+    expect(pkg.types).toBe("./dist/index.d.ts");
+    expect(pkg.files).toContain("dist");
+    expect(pkg.pi?.extensions).toEqual(["./dist/index.js"]);
+  });
+
+  it("emits declarations alongside the bundle", () => {
+    expect(pkg.scripts.build).toContain("tsc --emitDeclarationOnly");
+  });
+
+  // The bundle keeps pi's packages external, so they must be resolvable in the
+  // consumer's tree. Declaring them makes that requirement machine-readable
+  // instead of an ERR_MODULE_NOT_FOUND at first import; `optional` keeps npm
+  // from installing a second copy beside the host's own.
+  it("declares every pi host package the bundle imports at runtime", () => {
+    const imported = new Set<string>();
+    for (const file of SRC_FILES) {
+      for (const specifier of runtimeHostImports(readFileSync(`${repoRoot}src/${file}`, "utf8"))) {
+        imported.add(specifier);
+      }
+    }
+
+    expect(imported.size).toBeGreaterThan(0);
+    for (const specifier of imported) {
+      expect(pkg.peerDependencies ?? {}, `${specifier} is imported but not declared`).toHaveProperty(specifier);
+      expect(pkg.peerDependenciesMeta?.[specifier]?.optional).toBe(true);
+    }
+  });
+
+  it("keeps pi's packages external so the host's own copy is used", () => {
+    for (const specifier of Object.keys(pkg.peerDependencies ?? {})) {
+      expect(pkg.scripts.build).toContain(`--external:${specifier}`);
+    }
+  });
+});
+
+describe("runtimeHostImports", () => {
+  it("ignores type-only imports", () => {
+    expect(runtimeHostImports('import type { Api } from "@earendil-works/pi-ai";')).toEqual([]);
+    expect(runtimeHostImports('import { type Api, type Model } from "@earendil-works/pi-ai";')).toEqual([]);
+  });
+
+  it("detects value imports, including mixed type/value clauses", () => {
+    expect(runtimeHostImports('import { type Api, clampThinkingLevel } from "@earendil-works/pi-ai";')).toEqual([
+      "@earendil-works/pi-ai",
+    ]);
+    expect(runtimeHostImports('import * as PiAi from "@earendil-works/pi-ai";')).toEqual(["@earendil-works/pi-ai"]);
+  });
+});

@@ -100,9 +100,15 @@ isNonRetryableBodyError(body); // hard quota → do not retry
 ```
 
 These are Kiro's own codes, not a provider taxonomy: mapping them to your own
-semantics is the consumer's job. The entry point also imports pi's host packages
-(`@earendil-works/pi-ai` and friends), which are already present wherever this
-extension runs.
+semantics is the consumer's job.
+
+One caveat for consumers outside pi: the entry point is the whole provider, so
+importing it loads modules that import pi's host packages
+(`@earendil-works/pi-ai`, `-pi-coding-agent`, `-pi-tui`). They are declared as
+optional peer dependencies — present already wherever this runs as a pi
+extension, but a standalone project must install them itself or the import fails
+with `ERR_MODULE_NOT_FOUND`. The types resolve without them under the usual
+`skipLibCheck`.
 
 ## Development
 
