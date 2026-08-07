@@ -3698,6 +3698,50 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
+  it("keeps metadataEvent token counts when a meteringEvent credit frame follows", async () => {
+    // MeteringEvent.usage is a NUMBER of credits. It is the only top-level
+    // `usage` the service emits, and the pre-routing field ladder consumed it as
+    // a token object, reading .inputTokens/.outputTokens off a number. Framed
+    // with an explicit `:event-type` because a units-only or count-only metering
+    // payload cannot be reliably inferred from its shape.
+    const frames = concatMessages(
+      encodeEventMessage({ content: "Hello" }),
+      encodeEventMessage(
+        { tokenUsage: { uncachedInputTokens: 500, outputTokens: 200, totalTokens: 700 } },
+        "metadataEvent",
+      ),
+      encodeEventMessage({ usage: 3, unit: "credit", unitPlural: "credits" }, "meteringEvent"),
+    );
+    const mockFetch = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({ done: false, value: frames })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          releaseLock: () => {},
+        }),
+        cancel: async () => {},
+      },
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg).toBeDefined();
+    if (!msg) throw new Error("Expected a completed assistant message");
+
+    // The credit count must not land in, or erase, token accounting.
+    expect(msg.usage.input).toBe(500);
+    expect(msg.usage.output).toBe(200);
+    expect(msg.usage.totalTokens).toBe(700);
+
+    vi.unstubAllGlobals();
+  });
+
   it("merges metadataEvent frames so a later stopReason frame cannot erase token counts", async () => {
     // Every MetadataEvent field is optional; tokenUsage and stopReason may
     // arrive in separate frames.

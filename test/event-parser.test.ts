@@ -257,6 +257,17 @@ describe("Feature 8: Stream Event Parsing", () => {
       expect(parseKiroExceptionFrame("metadataEvent", { tokenUsage: {} })).toBeNull();
       expect(parseKiroExceptionFrame("SomeFutureException", { message: "x" })).toBeNull();
     });
+
+    it("does not treat an Object.prototype key as a modeled member", () => {
+      // `:exception-type` is chosen by the service, so the member table must be
+      // read by own property. A bare index resolves inherited members, and the
+      // resulting truthy hit yields kind/error undefined — the caller then skips
+      // its unmodeled-member fallback and loses the name entirely, which is the
+      // exact class loss this routing removes.
+      for (const key of ["toString", "constructor", "hasOwnProperty", "valueOf", "__proto__"]) {
+        expect(parseKiroExceptionFrame(key, { message: "x" })).toBeNull();
+      }
+    });
   });
 
   describe("parseKiroEventByShape — fail-open fallback", () => {

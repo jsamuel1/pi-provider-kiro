@@ -72,6 +72,19 @@ export const KIRO_ERROR_MEMBERS: Readonly<Record<string, { kind: KiroErrorKind; 
   serviceUnavailableError: { kind: "serviceUnavailable", exception: "ServiceUnavailableException" },
 };
 
+/**
+ * Look up an error member by a key the SERVICE chose.
+ *
+ * `KIRO_ERROR_MEMBERS` is an ordinary object literal, so a bare index would
+ * also resolve inherited `Object.prototype` members: an `:exception-type` of
+ * `toString` or `constructor` returns a truthy value whose `kind` and
+ * `exception` are both undefined, silently discarding the member name this
+ * routing exists to preserve. Only own properties count as modeled members.
+ */
+function lookupErrorMember(key: string): { kind: KiroErrorKind; exception: string } | undefined {
+  return Object.hasOwn(KIRO_ERROR_MEMBERS, key) ? KIRO_ERROR_MEMBERS[key] : undefined;
+}
+
 export type KiroErrorData = {
   /** Exception class name, or the legacy free-form `error` string. */
   error: string;
@@ -226,7 +239,8 @@ export function parseKiroEvent(key: string, parsed: Record<string, unknown>): Ki
     case "throttlingError":
     case "validationError":
     case "serviceUnavailableError": {
-      const member = KIRO_ERROR_MEMBERS[key];
+      // Literal case labels, so the own-property lookup always resolves.
+      const member = lookupErrorMember(key) as { kind: KiroErrorKind; exception: string };
       return parseError(parsed, member.kind, member.exception);
     }
     // Known members with no consumer yet: explicitly ignored, not unparseable.
@@ -251,7 +265,7 @@ export function parseKiroEvent(key: string, parsed: Record<string, unknown>): Ki
  * never produces.
  */
 export function parseKiroExceptionFrame(key: string, parsed: Record<string, unknown>): KiroErrorData | null {
-  const member = KIRO_ERROR_MEMBERS[key];
+  const member = lookupErrorMember(key);
   if (!member) return null;
   const event = parseError(parsed, member.kind, member.exception);
   return event.data;
