@@ -16,9 +16,12 @@ const codec = new EventStreamCodec(
 export function inferEventKey(payload: Record<string, unknown>): KiroEventKey | "$unknown" {
   if (payload.content !== undefined) return "assistantResponseEvent";
   if (typeof payload.text === "string" || typeof payload.signature === "string") return "reasoningContentEvent";
+  // contextUsagePercentage is checked before the toolUse `stop` branch for the
+  // same reason parseKiroEventByShape guards it: a contextUsageEvent payload can
+  // also carry `stop`, and inferring toolUseEvent there would frame it wrongly.
+  if (payload.contextUsagePercentage !== undefined) return "contextUsageEvent";
   if (payload.toolUseId !== undefined || payload.input !== undefined || payload.stop !== undefined)
     return "toolUseEvent";
-  if (payload.contextUsagePercentage !== undefined) return "contextUsageEvent";
   if (payload.tokenUsage !== undefined || payload.stopReason !== undefined || payload.stopDetails !== undefined)
     return "metadataEvent";
   if (typeof payload.usage === "number") return "meteringEvent";
