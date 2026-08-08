@@ -2,11 +2,20 @@
 // ABOUTME: throw site already computed so consumers need not re-parse the message.
 
 /**
- * Reason codes Kiro returns in the `reason` field of a JSON error body.
- * Not exhaustive — `reasonCode` is a passthrough of whatever the body carried,
- * so an unrecognized code still reaches the consumer verbatim.
+ * Known reason-code markers to scan for when the body is not parseable JSON.
+ *
+ * Deliberately module-private and deliberately NOT named `KIRO_REASON_CODES`:
+ * this is only a fallback marker list for `extractKiroReasonCode`, not a public
+ * vocabulary. The literals it shares with `src/retry.ts` (`TOO_BIG_PATTERNS`,
+ * `NON_RETRYABLE_BODY_PATTERNS`, `CAPACITY_PATTERN`) are matched there for
+ * *classification*, which is a separate concern — `Input is too long` is a
+ * classification marker with no reason code, and `REQUEST_BODY_INVALID` is a
+ * reason code that must never classify as too-big.
+ *
+ * Not exhaustive: `reasonCode` is a passthrough of whatever the body carried, so
+ * an unrecognized code still reaches the consumer verbatim.
  */
-export const KIRO_REASON_CODES = [
+const REASON_CODE_MARKERS = [
   "CONTENT_LENGTH_EXCEEDS_THRESHOLD",
   "MONTHLY_REQUEST_COUNT",
   "INSUFFICIENT_MODEL_CAPACITY",
@@ -72,7 +81,7 @@ export function extractKiroReasonCode(errorText: string): string | undefined {
       // Fall through to marker scan — a truncated or wrapped body is still useful.
     }
   }
-  return KIRO_REASON_CODES.find((code) => errorText.includes(code));
+  return REASON_CODE_MARKERS.find((code) => errorText.includes(code));
 }
 
 /**
