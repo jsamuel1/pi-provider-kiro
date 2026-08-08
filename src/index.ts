@@ -31,8 +31,12 @@ export {
   validateKiroConversation,
   validateKiroToolStructure,
 } from "./history-validator.js";
-export type { KiroErrorPlane } from "./management.js";
-export { isKiroManagementHttpError, KiroManagementHttpError } from "./management.js";
+export type { KiroErrorPlane, KiroManagementErrorInfo } from "./management.js";
+export {
+  isKiroManagementHttpError,
+  KIRO_AUTH_PLANE_DIAGNOSTIC,
+  KiroManagementHttpError,
+} from "./management.js";
 export { KIRO_MODEL_IDS, kiroModels, resolveKiroModel } from "./models.js";
 export { streamKiro } from "./stream.js";
 export {
