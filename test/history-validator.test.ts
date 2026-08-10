@@ -34,7 +34,7 @@ const result = (id: string): KiroToolResult => ({ toolUseId: id, content: [{ tex
 
 const rulesOf = (entries: KiroHistoryEntry[]) => validateKiroConversation(entries).errors.map((e) => e.rule);
 
-describe("Feature 10: History Validation", () => {
+describe("Feature 11: History Validation", () => {
   // Each invariant gets an accepting and a rejecting case. The rule names are
   // the contract — they match kiro-agent's ValidationRule enum, so a rename
   // here silently breaks cross-codebase grep.

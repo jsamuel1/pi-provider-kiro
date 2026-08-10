@@ -1541,6 +1541,108 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
+  // -----------------------------------------------------------------------
+  // The pre-send invariant check, exercised through `streamKiro` rather than
+  // through `validateKiroConversation` directly. Unit tests on the validator
+  // prove the rules; only these prove the request builder actually runs them.
+  //
+  // MUTATION PROBE: delete the `kiroConversationEntries`/
+  // `validateKiroConversation` block in stream.ts and the first of these goes
+  // red. Nothing else in the suite does — `tsc` still passes and biome reports
+  // the orphaned imports as a warning with exit 0.
+  //
+  // Reachability: `sanitizeHistory` repairs orphaned results inside `history`
+  // by synthesizing an `unknown_tool` toolUse, but the current message is
+  // assembled after that pass and is not covered by it. A tool result whose id
+  // matches no toolUse in the preceding assistant entry therefore survives to
+  // the check — the same shape the backend rejects as
+  // `400 TOOL_USE_RESULT_MISMATCH`.
+  // -----------------------------------------------------------------------
+
+  it("warns when the outbound tool structure violates an invariant", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const assistantWithTool: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tcA", name: "calc", arguments: {} }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        ...settledTurn(),
+        assistantWithTool,
+        // Answers `tcZ`, which no preceding toolUse issued.
+        {
+          role: "toolResult",
+          toolCallId: "tcZ",
+          toolName: "calc",
+          content: [{ type: "text", text: "orphan" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "calc", description: "Calculate", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(warned).toContain("outbound history violates");
+    expect(warned).toMatch(/TOOL_USES_AND_RESULTS|TOOL_RESULTS_ORPHAN_IDS/);
+    // Diagnostic only — the request still goes out.
+    expect(mockFetch).toHaveBeenCalled();
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("stays silent on a well-formed tool turn", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const assistantWithTool: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tcA", name: "calc", arguments: {} }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        ...settledTurn(),
+        assistantWithTool,
+        {
+          role: "toolResult",
+          toolCallId: "tcA",
+          toolName: "calc",
+          content: [{ type: "text", text: "7" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "calc", description: "Calculate", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(warned).not.toContain("outbound history violates");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
   // The observed failure: a host appended a reminder message carrying a role
   // outside pi-ai's `Message` union ("developer") after a settled assistant
   // turn. None of the current-message branches matched it, so `content` went

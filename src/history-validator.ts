@@ -1,4 +1,4 @@
-// Feature 10: Conversation History Validation
+// Feature 11: Conversation History Validation
 //
 // The seven invariants first-party Kiro Agent enforces on a conversation before
 // sending it, ported to this provider's request shape.
