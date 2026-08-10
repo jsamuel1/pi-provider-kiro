@@ -38,7 +38,12 @@ function getMaxTrailingPossibleTagPrefixLength(text: string, tags: string[]): nu
 export class ThinkingTagParser {
   private textBuffer = "";
   private inThinking = false;
-  private thinkingExtracted = false;
+  /**
+   * True once a thinking region has closed. Only gates the hoist in
+   * `emitThinking()` — a message may contain any number of thinking regions,
+   * so this must never stop later open tags from being recognized.
+   */
+  private thinkingBlockEmitted = false;
   private thinkingBlockIndex: number | null = null;
   private textBlockIndex: number | null = null;
   private lastTextBlockIndex: number | null = null;
@@ -53,7 +58,7 @@ export class ThinkingTagParser {
     this.textBuffer += chunk;
     while (this.textBuffer.length > 0) {
       const prevLength = this.textBuffer.length;
-      if (!this.inThinking && !this.thinkingExtracted) {
+      if (!this.inThinking) {
         this.processBeforeThinking();
         if (this.textBuffer.length === 0) break;
       }
@@ -61,10 +66,7 @@ export class ThinkingTagParser {
         this.processInsideThinking();
         if (this.textBuffer.length === 0) break;
       }
-      if (this.thinkingExtracted) {
-        this.processAfterThinking();
-        break;
-      }
+      // No progress: the remainder is a held-back partial tag prefix.
       if (this.textBuffer.length >= prevLength) break;
     }
   }
@@ -140,7 +142,11 @@ export class ThinkingTagParser {
       }
       this.textBuffer = this.textBuffer.slice(endPos + this.activeEndTag.length);
       this.inThinking = false;
-      this.thinkingExtracted = true;
+      this.thinkingBlockEmitted = true;
+      // Reset so a later region in the same message opens its own thinking
+      // block instead of appending to this one.
+      this.thinkingBlockIndex = null;
+      this.activeEndTag = THINKING_END_TAG;
       this.lastTextBlockIndex = this.textBlockIndex;
       this.textBlockIndex = null;
       if (this.textBuffer.startsWith("\n\n")) this.textBuffer = this.textBuffer.slice(2);
@@ -153,11 +159,6 @@ export class ThinkingTagParser {
       this.emitThinking(this.textBuffer.slice(0, safeLen));
       this.textBuffer = this.textBuffer.slice(safeLen);
     }
-  }
-
-  private processAfterThinking(): void {
-    this.emitText(this.textBuffer);
-    this.textBuffer = "";
   }
 
   private emitText(text: string): void {
@@ -175,10 +176,12 @@ export class ThinkingTagParser {
   private emitThinking(thinking: string): void {
     if (!thinking) return;
     if (this.thinkingBlockIndex === null) {
-      if (this.textBlockIndex !== null) {
+      if (this.textBlockIndex !== null && !this.thinkingBlockEmitted) {
         // Thinking arrived after text was already emitted (Kiro API sends
         // text before thinking content). Insert the thinking block before
         // the text block so the content array order is thinking → text.
+        // Only the first region may hoist: once a region has closed, any
+        // preceding text genuinely came first and must keep its position.
         this.thinkingBlockIndex = this.textBlockIndex;
         this.output.content.splice(this.thinkingBlockIndex, 0, { type: "thinking", thinking: "" });
         this.textBlockIndex = this.textBlockIndex + 1;

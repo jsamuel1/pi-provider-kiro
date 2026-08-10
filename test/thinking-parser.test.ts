@@ -213,6 +213,85 @@ describe("Feature 7: Thinking Tag Parser", () => {
     expect(parser.getTextBlockIndex()).toBe(1);
   });
 
+  // =========================================================================
+  // Multiple thinking regions in a single streamed message
+  // =========================================================================
+
+  it("recognizes a second thinking region in the same message", async () => {
+    const events = await run(["<thinking>first</thinking>\n\nmiddle<thinking>second</thinking>\n\nend"]);
+    const thinking = deltas(events, "thinking_delta");
+    expect(thinking).toContain("first");
+    expect(thinking).toContain("second");
+  });
+
+  it("never leaks literal tag text into visible text after the first region", async () => {
+    const events = await run(["<thinking>first</thinking>\n\nmiddle<thinking>second</thinking>\n\nend"]);
+    const text = deltas(events, "text_delta");
+    expect(text).not.toContain("<thinking>");
+    expect(text).not.toContain("</thinking>");
+    expect(text).toBe("middleend");
+  });
+
+  it("files each thinking region as its own thinking block", async () => {
+    const output = makeOutput();
+    const stream = createAssistantMessageEventStream();
+    const parser = new ThinkingTagParser(output, stream);
+
+    parser.processChunk("<thinking>first</thinking>\n\nmiddle<thinking>second</thinking>\n\nend");
+    parser.finalize();
+
+    const thinkingBlocks = output.content.filter((b) => b.type === "thinking");
+    expect(thinkingBlocks.map((b) => (b as { thinking: string }).thinking)).toEqual(["first", "second"]);
+  });
+
+  it("does not reorder a later thinking region ahead of preceding text", async () => {
+    const output = makeOutput();
+    const stream = createAssistantMessageEventStream();
+    const parser = new ThinkingTagParser(output, stream);
+
+    parser.processChunk("<thinking>first</thinking>\n\nmiddle<thinking>second</thinking>\n\nend");
+    parser.finalize();
+
+    // Only the first thinking block may be hoisted ahead of text (the Kiro API
+    // sends text before the first thinking content). Later regions stay put.
+    expect(output.content.map((b) => b.type)).toEqual(["thinking", "text", "thinking", "text"]);
+  });
+
+  it("recognizes a second region using a different tag variant", async () => {
+    const events = await run(["<think>a</think>\n\nmid<reasoning>b</reasoning>\n\nz"]);
+    const thinking = deltas(events, "thinking_delta");
+    expect(thinking).toContain("a");
+    expect(thinking).toContain("b");
+    expect(deltas(events, "text_delta")).toBe("midz");
+  });
+
+  it("detects a second region whose open tag is split across chunks", async () => {
+    const events = await run(["<thinking>a</thinking>\n\nmid<thin", "king>b</thinking>\n\nz"]);
+    const thinking = deltas(events, "thinking_delta");
+    expect(thinking).toContain("a");
+    expect(thinking).toContain("b");
+    expect(deltas(events, "text_delta")).toBe("midz");
+  });
+
+  it("emits a thinking_end for every region", async () => {
+    const events = await run(["<thinking>a</thinking>\n\nmid<thinking>b</thinking>\n\nz"]);
+    expect(events.filter((e) => e.type === "thinking_end")).toHaveLength(2);
+    expect(events.filter((e) => e.type === "thinking_start")).toHaveLength(2);
+  });
+
+  it("getTextBlockIndex points at the last text block across regions", () => {
+    const output = makeOutput();
+    const stream = createAssistantMessageEventStream();
+    const parser = new ThinkingTagParser(output, stream);
+
+    parser.processChunk("<thinking>a</thinking>\n\nmid<thinking>b</thinking>\n\nz");
+    parser.finalize();
+
+    // content: [thinking a, text mid, thinking b, text z]
+    expect(parser.getTextBlockIndex()).toBe(3);
+    expect((output.content[3] as { text: string }).text).toBe("z");
+  });
+
   it("handles text-before-thinking across multiple chunks", async () => {
     const output = makeOutput();
     const stream = createAssistantMessageEventStream();
