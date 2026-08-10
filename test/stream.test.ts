@@ -1643,6 +1643,54 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
+  // Probed 2026-08-11 before this test existed: this context reached the wire as
+  // `currentMessage.userInputMessage` with populated `toolResults`, no `history`
+  // at all, and no `toolUse` anywhere — the exact shape the backend rejects as
+  // `TOOL_USE_RESULT_MISMATCH` — while the invariant check stayed silent, because
+  // the pairwise walk only inspects a carrier that follows an assistant entry.
+  //
+  // MUTATION PROBE: drop the unpaired-carrier pass at the end of
+  // `validateToolUsesAndResults` and this goes red.
+  it("warns when a tool-result carrier has no toolUse anywhere", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        // No assistant turn ever issued `tcZ`. `sanitizeHistory` cannot repair
+        // this one: the carrier is the current message, not a history entry.
+        {
+          role: "toolResult",
+          toolCallId: "tcZ",
+          toolName: "calc",
+          content: [{ type: "text", text: "orphan" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "calc", description: "Calculate", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(
+      streamKiro(makeModel({ kiroProfileArn: "arn:aws:codewhisperer:us-east-1:0:profile/X" }), context, {
+        apiKey: "tok",
+      }),
+    );
+
+    const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(warned).toContain("outbound history violates");
+    expect(warned).toContain("TOOL_RESULTS_AND_NO_USES");
+    // Diagnostic only — the request still goes out.
+    const body = mockFetch.mock.calls[0][1].body as string;
+    expect(
+      JSON.parse(body).conversationState.currentMessage.userInputMessage.userInputMessageContext.toolResults,
+    ).toHaveLength(1);
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
   // The observed failure: a host appended a reminder message carrying a role
   // outside pi-ai's `Message` union ("developer") after a settled assistant
   // turn. None of the current-message branches matched it, so `content` went

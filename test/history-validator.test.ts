@@ -138,6 +138,29 @@ describe("Feature 11: History Validation", () => {
       const err = errors.find((e) => e.rule === KiroValidationRule.TOOL_RESULTS_AND_NO_USES);
       expect(err?.index).toBe(1);
     });
+
+    // The pairwise walk only inspects a carrier that follows an assistant entry,
+    // so a carrier with no assistant predecessor at all needs its own pass.
+    // Reachable as the current message: `prepareHistory` guarantees every carrier
+    // inside `history` is preceded by an assistant with toolUses, but the current
+    // message is assembled after that pass.
+    it("rejects a lone tool-result carrier with no toolUse anywhere", () => {
+      const errors = validateKiroConversation([userEntry("", [result("tcZ")])]).errors;
+      const err = errors.find((e) => e.rule === KiroValidationRule.TOOL_RESULTS_AND_NO_USES);
+      expect(err?.index).toBe(0);
+    });
+
+    it("rejects a tool-result carrier preceded by another user message", () => {
+      const errors = validateKiroConversation([userEntry("go"), userEntry("", [result("tcZ")])]).errors;
+      const err = errors.find((e) => e.rule === KiroValidationRule.TOOL_RESULTS_AND_NO_USES);
+      expect(err?.index).toBe(1);
+    });
+
+    it("reports the unpaired carrier as a tool-structure rule so the send path warns", () => {
+      const subset = validateKiroToolStructure([userEntry("", [result("tcZ")])]);
+      expect(subset.valid).toBe(false);
+      expect(subset.errors.every((e) => isKiroToolStructureRule(e.rule))).toBe(true);
+    });
   });
 
   describe("TOOL_RESULTS_ORPHAN_IDS", () => {

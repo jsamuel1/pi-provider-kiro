@@ -171,6 +171,22 @@ export function validateToolUsesAndResults(entries: KiroHistoryEntry[]): KiroVal
       return error(KiroValidationRule.TOOL_RESULTS_AND_NO_USES, i);
     }
   }
+  // A carrier with no assistant predecessor at all — first entry, or preceded by
+  // another user entry. The pairwise walk above cannot see it: it only inspects
+  // a carrier that follows an assistant entry. kiro-agent never reaches this
+  // shape because its sanitizer drops leading carriers before validating, but
+  // this provider can send one as the *current* message: `prepareHistory`
+  // guarantees every carrier inside `history` has an assistant-with-toolUses
+  // predecessor (`sanitizeHistory` drops the rest, `injectSyntheticToolCalls`
+  // synthesizes uses for orphans), and the current message is assembled after
+  // that pass. Probed 2026-08-11: a lone current-turn carrier reached the wire
+  // with `toolResults` and no `toolUse` anywhere while this check stayed silent.
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    if (!isUserEntry(entry) || !hasToolResults(entry)) continue;
+    const prev = i > 0 ? entries[i - 1] : undefined;
+    if (!isAssistantEntry(prev)) return error(KiroValidationRule.TOOL_RESULTS_AND_NO_USES, i);
+  }
   return null;
 }
 
