@@ -9,7 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Send a placeholder instead of an empty `content` when a turn carries no text, and stop reporting Kiro's generic "Improperly formed request." rejection as a context overflow. A host that appends a message whose role falls outside pi-ai's `Message` union produced `content: ""`, which Kiro rejects with `400 REQUEST_BODY_INVALID`; relabeling that as `context_length_exceeded` then drove the caller into a compaction loop against a request that was structurally invalid rather than oversized. Also covers image-only and empty-text user messages.
+- Stop injecting `"Tool results provided."` into tool-result turns. A tool turn's payload is `userInputMessageContext.toolResults`; Kiro's requirement is content **or** tool results, so its `content` is now empty. Previously every tool turn shipped that sentence as a user utterance — and the merge path appended it onto the text of a message the user had actually written. Wire-probed against `runtime.us-east-1.kiro.dev` with `origin: "KIRO_CLI"`: `content: ""` plus populated `toolResults` returns HTTP 200. Matches first-party Kiro Agent, which ships `content: ''` on synthesized and consolidated tool turns.
+- Send a placeholder instead of an empty `content` when a turn carries no text, and stop reporting Kiro's generic "Improperly formed request." rejection as a context overflow. A host that appends a message whose role falls outside pi-ai's `Message` union produced `content: ""`, which Kiro rejects with `400 REQUEST_BODY_INVALID`; relabeling that as `context_length_exceeded` then drove the caller into a compaction loop against a request that was structurally invalid rather than oversized. Also covers image-only and empty-text user messages. That fallback is now scoped to turns with no tool results, so it cannot refill a tool turn.
+
+### Added
+
+- `src/history-validator.ts` (F10): the seven conversation invariants first-party Kiro Agent enforces, ported to this provider's request shape — `STARTS_WITH_USER_MESSAGE`, `ENDS_WITH_USER_MESSAGE`, `ALTERNATING_MESSAGES`, `TOOL_USES_AND_RESULTS`, `TOOL_RESULTS_AND_NO_USES`, `TOOL_RESULTS_ORPHAN_IDS`, `NON_EMPTY_USER_MESSAGE`. Exported from the package root as `validateKiroConversation`, `validateKiroToolStructure`, `repairKiroConversation`, `kiroConversationEntries`, `KiroValidationRule`, `KIRO_VALIDATION_MESSAGES`, `KIRO_TOOL_STRUCTURE_RULES`, `isKiroToolStructureRule`, and `SYNTHETIC_FAILED_TOOL_RESULT_TEXT`, so a consumer can pre-check a history it built. `streamKiro` runs the check before sending and logs violations; it does not throw, because failing closed would change behavior for callers whose histories send today.
+- Package root now also exports `EMPTY_CONTENT_PLACEHOLDER` and the `KiroHistoryEntry` / `KiroUserInputMessage` / `KiroToolResult` / `KiroToolUse` types.
 
 ## [0.9.3] - 2026-07-24
 

@@ -16,8 +16,30 @@ import { fetchKiroUsage } from "./usage.js";
 
 export { resolveApiRegion } from "./endpoints.js";
 export type { KiroStreamEvent } from "./event-parser.js";
+export {
+  isKiroToolStructureRule,
+  KIRO_TOOL_STRUCTURE_RULES,
+  KIRO_VALIDATION_MESSAGES,
+  type KiroRepairResult,
+  type KiroToolStructureRule,
+  type KiroValidationError,
+  type KiroValidationResult,
+  KiroValidationRule,
+  kiroConversationEntries,
+  repairKiroConversation,
+  SYNTHETIC_FAILED_TOOL_RESULT_TEXT,
+  validateKiroConversation,
+  validateKiroToolStructure,
+} from "./history-validator.js";
 export { KIRO_MODEL_IDS, kiroModels, resolveKiroModel } from "./models.js";
 export { streamKiro } from "./stream.js";
+export {
+  EMPTY_CONTENT_PLACEHOLDER,
+  type KiroHistoryEntry,
+  type KiroToolResult,
+  type KiroToolUse,
+  type KiroUserInputMessage,
+} from "./transform.js";
 
 /**
  * Host-driven catalog refresh. `oauth.modifyModels` only projects whatever the
