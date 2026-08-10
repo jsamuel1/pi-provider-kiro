@@ -292,6 +292,22 @@ describe("Feature 7: Thinking Tag Parser", () => {
     expect((output.content[3] as { text: string }).text).toBe("z");
   });
 
+  it("keeps the last text index when back-to-back regions have no text between them", () => {
+    const output = makeOutput();
+    const stream = createAssistantMessageEventStream();
+    const parser = new ThinkingTagParser(output, stream);
+
+    parser.processChunk("<thinking>a</thinking>\n\nmid<thinking>b</thinking><thinking>c</thinking>");
+    parser.finalize();
+
+    // content: [thinking a, text mid, thinking b, thinking c]. Closing region c
+    // must not erase the index of the "mid" text block: stream.ts relies on it
+    // for text_end, bracket tool-call recovery and echo stripping.
+    expect(output.content.map((b) => b.type)).toEqual(["thinking", "text", "thinking", "thinking"]);
+    expect(parser.getTextBlockIndex()).toBe(1);
+    expect((output.content[1] as { text: string }).text).toBe("mid");
+  });
+
   it("handles text-before-thinking across multiple chunks", async () => {
     const output = makeOutput();
     const stream = createAssistantMessageEventStream();

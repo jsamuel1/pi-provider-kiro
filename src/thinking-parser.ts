@@ -147,7 +147,10 @@ export class ThinkingTagParser {
       // block instead of appending to this one.
       this.thinkingBlockIndex = null;
       this.activeEndTag = THINKING_END_TAG;
-      this.lastTextBlockIndex = this.textBlockIndex;
+      // Only advance the remembered index: back-to-back regions with no text
+      // between them would otherwise clobber a real index with null, and
+      // `getTextBlockIndex()` would report no text block to `stream.ts`.
+      if (this.textBlockIndex !== null) this.lastTextBlockIndex = this.textBlockIndex;
       this.textBlockIndex = null;
       if (this.textBuffer.startsWith("\n\n")) this.textBuffer = this.textBuffer.slice(2);
       return;
