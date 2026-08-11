@@ -38,12 +38,6 @@ function getMaxTrailingPossibleTagPrefixLength(text: string, tags: string[]): nu
 export class ThinkingTagParser {
   private textBuffer = "";
   private inThinking = false;
-  /**
-   * True once a thinking region has closed. Only gates the hoist in
-   * `ensureThinkingBlock()` — a message may contain any number of thinking
-   * regions, so this must never stop later open tags from being recognized.
-   */
-  private thinkingBlockEmitted = false;
   private thinkingBlockIndex: number | null = null;
   private textBlockIndex: number | null = null;
   private lastTextBlockIndex: number | null = null;
@@ -141,7 +135,6 @@ export class ThinkingTagParser {
       });
       this.textBuffer = this.textBuffer.slice(endPos + this.activeEndTag.length);
       this.inThinking = false;
-      this.thinkingBlockEmitted = true;
       // Reset so a later region in the same message opens its own thinking
       // block instead of appending to this one.
       this.thinkingBlockIndex = null;
@@ -177,19 +170,12 @@ export class ThinkingTagParser {
 
   private ensureThinkingBlock(): number {
     if (this.thinkingBlockIndex !== null) return this.thinkingBlockIndex;
-    if (this.textBlockIndex !== null && !this.thinkingBlockEmitted) {
-      // Thinking arrived after text was already emitted (Kiro API sends
-      // text before thinking content). Insert the thinking block before
-      // the text block so the content array order is thinking → text.
-      // Only the first region may hoist: once a region has closed, any
-      // preceding text genuinely came first and must keep its position.
-      this.thinkingBlockIndex = this.textBlockIndex;
-      this.output.content.splice(this.thinkingBlockIndex, 0, { type: "thinking", thinking: "" });
-      this.textBlockIndex = this.textBlockIndex + 1;
-    } else {
-      this.thinkingBlockIndex = this.output.content.length;
-      this.output.content.push({ type: "thinking", thinking: "" });
-    }
+    // Always append, never splice: blocks keep wire order and a `contentIndex`
+    // names one block for the whole stream. Splicing ahead of earlier text
+    // would strand every index already emitted, and pi-ai has no reindex event
+    // to correct it. Presentation order is the renderer's job.
+    this.thinkingBlockIndex = this.output.content.length;
+    this.output.content.push({ type: "thinking", thinking: "" });
     this.stream.push({ type: "thinking_start", contentIndex: this.thinkingBlockIndex, partial: this.output });
     return this.thinkingBlockIndex;
   }
