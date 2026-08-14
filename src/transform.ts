@@ -88,6 +88,55 @@ export function normalizeMessages(messages: Message[]): Message[] {
   });
 }
 
+/**
+ * Move each `toolResult` to sit immediately after the assistant turn that
+ * issued its `toolCall`, matching by id.
+ *
+ * Concurrent tool executions appending to one transcript can interleave, so a
+ * result arrives behind a LATER assistant turn than the one that called it:
+ *
+ *     assistant(toolUses=[A]) / user(text) / assistant(toolUses=[B]) / toolResult(A)
+ *
+ * Bedrock requires the message after a tool use to carry that use's results,
+ * matched by id, so this shape is rejected with `400 TOOL_USE_RESULT_MISMATCH`.
+ * Without this pass the downstream repair still makes the request sendable, but
+ * only by discarding `A`'s real output: `sanitizeHistory` tests pairing
+ * POSITIONALLY and drops `assistant(toolUses=[A])` because its next entry is
+ * the interjection, after which `A`'s result answers nothing and is stripped.
+ *
+ * This is a pure reorder. Nothing is fabricated, dropped, or rewritten, and a
+ * result whose `toolCall` appears nowhere is left in place for
+ * `injectSyntheticToolCalls` to handle. A well-formed transcript — where every
+ * result already follows its call — is returned unchanged.
+ *
+ * The cost is wire chronology: a user turn that interrupted between the call
+ * and its result now appears AFTER that result. That misplaces when the user
+ * spoke, which is a fidelity loss, but it is not fabrication and it is strictly
+ * less lossy than discarding real tool output the model is waiting on.
+ */
+export function relocateDisplacedToolResults(messages: Message[]): Message[] {
+  const out: Message[] = [];
+  const pending = [...messages];
+  while (pending.length > 0) {
+    const msg = pending.shift() as Message;
+    out.push(msg);
+    if (msg.role !== "assistant") continue;
+    const am = msg as AssistantMessage;
+    if (!Array.isArray(am.content)) continue;
+    // Emit this turn's results in the order the turn declared its calls, so a
+    // multi-call turn keeps its results contiguous behind it.
+    for (const block of am.content) {
+      if (block.type !== "toolCall") continue;
+      const id = (block as ToolCall).id;
+      // Search only what is still pending: a result already emitted belongs to
+      // an earlier turn and must not be pulled forward.
+      const at = pending.findIndex((p) => p.role === "toolResult" && (p as ToolResultMessage).toolCallId === id);
+      if (at >= 0) out.push(...pending.splice(at, 1));
+    }
+  }
+  return out;
+}
+
 export function extractImages(msg: Message): ImageContent[] {
   if (msg.role === "toolResult" || typeof msg.content === "string") return [];
   if (!Array.isArray(msg.content)) return [];
@@ -159,8 +208,15 @@ export function buildHistory(
       const lastEntryForUim = history[history.length - 1];
       const prevUim = lastEntryForUim?.userInputMessage;
       if (prevUim) {
-        // Merge into previous user message to maintain alternation without synthetic padding
-        prevUim.content += `\n\n${uim.content}`;
+        // Merge into previous user message to maintain alternation without synthetic padding.
+        //
+        // Join only NON-EMPTY sides. A tool-result carrier now has `content: ""`
+        // (the whole point of this change), so an unconditional separator turns a
+        // real user utterance into `"\n\ncontinue"` on the wire — fabricating text
+        // onto a message the user actually wrote, which is the defect this change
+        // exists to remove. Two real utterances still get the separator.
+        prevUim.content =
+          prevUim.content && uim.content ? `${prevUim.content}\n\n${uim.content}` : prevUim.content || uim.content;
         if (uim.images) prevUim.images = [...(prevUim.images || []), ...uim.images];
       } else {
         history.push({ userInputMessage: uim });

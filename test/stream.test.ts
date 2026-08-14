@@ -11,7 +11,7 @@ import type {
 import { isContextOverflow } from "@earendil-works/pi-ai/compat";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { findJsonEnd } from "../src/bracket-tool-parser.js";
-import { KiroValidationRule, validateKiroConversation, validateKiroToolStructure } from "../src/history-validator.js";
+import { validateKiroConversation, validateKiroToolStructure } from "../src/history-validator.js";
 import { capacityRetryConfig, retryConfig } from "../src/retry.js";
 import { resetProfileArnCache, streamKiro } from "../src/stream.js";
 import { EMPTY_CONTENT_PLACEHOLDER, type KiroHistoryEntry } from "../src/transform.js";
@@ -1674,34 +1674,67 @@ describe("Feature 9: Streaming Integration", () => {
     );
     expect(armToolUses.map((tu: { toolUseId: string }) => tu.toolUseId)).toContain("B");
 
-    // ---- Two documented divergences from this card's amendment. ----
+    // ---- What relocation preserves, and what it still costs. ----
     //
-    // 1. `A`'s real output does NOT survive. The amendment expected repair to
-    //    preserve it. It cannot, and the reason is ordering: `prepareHistory`
-    //    runs first and `sanitizeHistory` drops `assistant(toolUses=[A])`
-    //    positionally (its next entry is the `continue` interjection, which
-    //    carries no results), so by the time repair sees the conversation, `A`'s
-    //    use exists nowhere and its result answers nothing.
+    // 1. `A`'s real output SURVIVES. `relocateDisplacedToolResults` moves the
+    //    displaced result back behind the assistant that issued it, before
+    //    anything positional runs, so `sanitizeHistory` no longer drops that
+    //    assistant and the result is no longer orphaned. This is a pure reorder:
+    //    nothing is fabricated and nothing is dropped.
+    expect(JSON.stringify(sent)).toContain("REAL_OUTPUT_A");
+    const historyResults = (sent.conversationState.history ?? []).flatMap(
+      (h: KiroHistoryEntry) => h.userInputMessage?.userInputMessageContext?.toolResults ?? [],
+    );
+    const resultA = historyResults.find((tr: { toolUseId: string }) => tr.toolUseId === "A");
+    expect(resultA).toBeDefined();
+    expect(resultA.status).toBe("success");
+    expect(resultA.content[0].text).toBe("REAL_OUTPUT_A");
+    // Paired with the assistant that actually issued it, which is what makes the
+    // request acceptable rather than merely present in the bytes.
+    const aIdx = (sent.conversationState.history ?? []).findIndex((h: KiroHistoryEntry) =>
+      h.assistantResponseMessage?.toolUses?.some((tu) => tu.toolUseId === "A"),
+    );
+    const afterA = (sent.conversationState.history ?? [])[aIdx + 1];
+    expect(afterA?.userInputMessage?.userInputMessageContext?.toolResults?.[0]?.toolUseId).toBe("A");
     //
-    //    Repairing raw history instead is worse, not better: repair would then
-    //    top up the real `continue` message with a synthetic failed result for
-    //    `A`, fabricating tool output onto a message the user actually wrote, and
-    //    `A`'s real result would still be stripped one step later.
+    // 2. The real user interjection survives VERBATIM. Merging it into the
+    //    now-empty carrier must not prepend a separator: `"continue"`, never
+    //    `"\n\ncontinue"`. Fabricating whitespace onto a message the user wrote is
+    //    the same defect class as the carrier prose this change removes.
+    const interjection = (sent.conversationState.history ?? []).find((h: KiroHistoryEntry) =>
+      h.userInputMessage?.userInputMessageContext?.toolResults?.some((tr) => tr.toolUseId === "A"),
+    );
+    expect(interjection?.userInputMessage?.content).toBe("continue");
     //
-    //    Preserving it needs a capability repair does not have — relocating a
-    //    displaced result behind a re-declaration of its use — which means either
-    //    reordering conversation chronology or putting the same `toolUseId` on
-    //    the wire twice. Neither is probed. Pinned here so the loss is a stated
-    //    behavior rather than a silent one.
-    expect(JSON.stringify(sent)).not.toContain("REAL_OUTPUT_A");
+    // 3. Wire chronology shifts, and that is the accepted cost. The interjection
+    //    was said BEFORE `A`'s result arrived, but appears after it on the wire,
+    //    because relocation moves the result and not the user turn. A fidelity
+    //    loss, not a fabrication, and strictly less lossy than discarding real
+    //    tool output the model is waiting on.
+    expect(aIdx).toBeLessThan(
+      (sent.conversationState.history ?? []).findIndex(
+        (h: KiroHistoryEntry) => h.userInputMessage?.content === "continue",
+      ),
+    );
     //
-    // 2. The repaired conversation is NOT valid under all seven rules. The
-    //    interjection leaves two consecutive user entries, and repair has no
-    //    alternation pass. That is deliberate: this provider documents that the
-    //    API accepts non-alternating history, and it is not a tool-structure
-    //    rule, so it stays in `remaining` and is not warned about.
+    // 4. `B` is still answered synthetically. Relocation makes `B` the trailing
+    //    turn with nothing after it, so repair supplies its missing result — the
+    //    same synthesis emitted before relocation existed. Relocation changes
+    //    which output is PRESERVED, not how much is fabricated.
+    //
+    // 5. All seven rules now pass for this shape — a better outcome than
+    //    relocation was expected to deliver. Before relocation the interjection
+    //    left two consecutive user entries and `ALTERNATING_MESSAGES` survived as
+    //    an unrepairable residual. Relocation moves `A`'s result to sit directly
+    //    behind `A`, and the interjection then merges INTO that carrier entry
+    //    rather than following it, so one user entry now carries both `A`'s real
+    //    result and the user's verbatim text. Alternation holds as a consequence.
+    //
+    //    This is asserted rather than assumed: it is the reason the residual list
+    //    is empty, and if a future change reintroduces a separate interjection
+    //    entry this goes red rather than silently regressing to a residual.
     const residual = validateKiroConversation(conversation).errors;
-    expect(residual.map((e) => e.rule)).toEqual([KiroValidationRule.ALTERNATING_MESSAGES]);
+    expect(residual).toEqual([]);
     const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
     expect(warned).not.toContain("outbound history");
 

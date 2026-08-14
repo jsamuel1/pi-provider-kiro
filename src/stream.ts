@@ -70,6 +70,7 @@ import {
   type KiroToolSpec,
   type KiroUserInputMessage,
   normalizeMessages,
+  relocateDisplacedToolResults,
   sanitizeSurrogates,
   TOOL_RESULT_LIMIT,
   truncate,
@@ -302,7 +303,13 @@ export function streamKiro(
       while (retryCount <= maxRetries) {
         if (options?.signal?.aborted) throw options.signal.reason;
         const effectiveSystemPrompt = systemPrompt;
-        const normalized = normalizeMessages(context.messages);
+        // Relocate a tool result that arrived behind a later assistant turn than
+        // the one that called it, before anything positional runs. Interleaved
+        // concurrent tool executions produce that shape, and `sanitizeHistory`
+        // pairs POSITIONALLY, so without this pass the displaced result's issuing
+        // assistant is dropped and the real tool output is discarded. Pure
+        // reorder — see `relocateDisplacedToolResults`.
+        const normalized = relocateDisplacedToolResults(normalizeMessages(context.messages));
         const {
           history: rawHistory,
           systemPrepended,

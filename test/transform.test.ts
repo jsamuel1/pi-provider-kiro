@@ -7,6 +7,7 @@ import {
   convertToolsToKiro,
   getContentText,
   normalizeMessages,
+  relocateDisplacedToolResults,
   sanitizeSurrogates,
   TOOL_RESULT_LIMIT,
   truncate,
@@ -369,6 +370,100 @@ describe("Feature 5: Message Transformation", () => {
         const { history } = buildHistory([user("hi"), empty], "M");
         expect(history.filter((h) => h.assistantResponseMessage)).toHaveLength(0);
       });
+    });
+  });
+
+  describe("relocateDisplacedToolResults", () => {
+    const call = (...ids: string[]): AssistantMessage =>
+      assistant("", {
+        content: ids.map((id) => ({ type: "toolCall" as const, id, name: "t", arguments: {} })),
+        stopReason: "toolUse",
+      });
+    const shape = (messages: Message[]) =>
+      messages.map((m) => (m.role === "toolResult" ? `result(${(m as ToolResultMessage).toolCallId})` : m.role));
+
+    it("is a no-op when every result already follows its call", () => {
+      const input: Message[] = [user("hi"), call("A"), toolResult("A", "out"), user("thanks")];
+      const out = relocateDisplacedToolResults(input);
+      expect(shape(out)).toEqual(shape(input));
+      // Same objects, not just the same shape — nothing is rebuilt or rewritten.
+      expect(out).toEqual(input);
+    });
+
+    it("is a no-op on a multi-call turn whose results already follow in order", () => {
+      const input: Message[] = [user("hi"), call("A", "B"), toolResult("A", "a"), toolResult("B", "b")];
+      expect(shape(relocateDisplacedToolResults(input))).toEqual(["user", "assistant", "result(A)", "result(B)"]);
+    });
+
+    it("moves a displaced result back behind the assistant that issued it", () => {
+      // The live skew: two concurrent executions interleaved into one transcript.
+      const out = relocateDisplacedToolResults([
+        user("start"),
+        call("A"),
+        user("continue"),
+        call("B"),
+        toolResult("A", "REAL_A"),
+      ]);
+      expect(shape(out)).toEqual(["user", "assistant", "result(A)", "user", "assistant"]);
+      // The user's interjection is preserved verbatim, just later on the wire.
+      expect((out[3] as UserMessage).content).toBe("continue");
+    });
+
+    it("reorders a multi-call turn's results to the order the turn declared them", () => {
+      const out = relocateDisplacedToolResults([
+        user("hi"),
+        call("A", "B"),
+        toolResult("B", "b"),
+        toolResult("A", "a"),
+      ]);
+      // Contiguous behind their turn, in declaration order, so the next message
+      // carries exactly that turn's results.
+      expect(shape(out)).toEqual(["user", "assistant", "result(A)", "result(B)"]);
+    });
+
+    it("matches by id — a result is never pulled behind a different tool use", () => {
+      const out = relocateDisplacedToolResults([user("hi"), call("A"), call("B"), toolResult("B", "b")]);
+      // `B`'s result must stay behind `B`. Moving it behind `A` would satisfy a
+      // positional pairing test while putting the wrong output on the wire.
+      expect(shape(out)).toEqual(["user", "assistant", "assistant", "result(B)"]);
+    });
+
+    it("leaves a result whose call appears nowhere in place", () => {
+      // `injectSyntheticToolCalls` owns this shape; relocation must not touch it.
+      const out = relocateDisplacedToolResults([user("hi"), call("A"), toolResult("A", "a"), toolResult("Z", "z")]);
+      expect(shape(out)).toEqual(["user", "assistant", "result(A)", "result(Z)"]);
+    });
+
+    it("never drops or duplicates a message", () => {
+      const input: Message[] = [
+        user("start"),
+        call("A"),
+        user("continue"),
+        call("B"),
+        toolResult("A", "a"),
+        toolResult("B", "b"),
+      ];
+      const out = relocateDisplacedToolResults(input);
+      expect(out).toHaveLength(input.length);
+      for (const m of input) expect(out).toContain(m);
+    });
+
+    it("merges a relocated carrier and a real user turn without fabricating separators", () => {
+      // The carrier now has `content: ""`, so an unconditional `\n\n` join would
+      // put `"\n\ncontinue"` on the wire for a user who typed `continue`.
+      const { history } = buildHistory(
+        relocateDisplacedToolResults([user("start"), call("A"), user("continue"), call("B"), toolResult("A", "a")]),
+        "M",
+      );
+      const carrier = history.find((h) => h.userInputMessage?.userInputMessageContext?.toolResults);
+      expect(carrier?.userInputMessage?.content).toBe("continue");
+    });
+
+    it("still separates two real consecutive user utterances", () => {
+      // A trailing user turn becomes the CURRENT message, so a third message is
+      // needed to force both utterances into history.
+      const { history } = buildHistory([user("first"), user("second"), assistant("ok"), user("third")], "M");
+      expect(history[0]?.userInputMessage?.content).toBe("first\n\nsecond");
     });
   });
 });
