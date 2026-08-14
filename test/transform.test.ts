@@ -1,5 +1,6 @@
 import type { AssistantMessage, Message, Tool, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
+import { kiroConversationEntries, validateKiroConversation } from "../src/history-validator.js";
 import {
   buildHistory,
   convertImagesToKiro,
@@ -299,6 +300,75 @@ describe("Feature 5: Message Transformation", () => {
         if (curr.userInputMessage) expect(next.assistantResponseMessage).toBeDefined();
         if (curr.assistantResponseMessage) expect(next.userInputMessage).toBeDefined();
       }
+    });
+
+    // -------------------------------------------------------------------
+    // Reasoning is excluded from the assistant text channel.
+    //
+    // `buildHistory` used to prepend `<thinking>...</thinking>` onto
+    // `assistantResponseMessage.content`, putting literal markup into the
+    // string the model reads back as its own prior speech. First-party Kiro
+    // Agent's `extractTextContent` type-filters to `text` blocks, so it never
+    // emits that markup; it carries reasoning in a typed `reasoningContent`
+    // field instead. These pin the text channel only.
+    //
+    // MUTATION PROBE: restore the concatenation in `transform.ts`
+    //   armContent = `<thinking>${...}</thinking>\n\n${armContent}`
+    // and the first test goes red.
+    // -------------------------------------------------------------------
+    describe("reasoning blocks", () => {
+      it("keeps the text and emits no <thinking> markup", () => {
+        const withThinking = assistant("");
+        withThinking.content = [
+          { type: "thinking", thinking: "let me consider the options" },
+          { type: "text", text: "The answer is 4." },
+        ];
+        const { history } = buildHistory([user("what is 2+2"), withThinking, user("thanks")], "M");
+        const arm = history.find((h) => h.assistantResponseMessage)?.assistantResponseMessage;
+        expect(arm?.content).toBe("The answer is 4.");
+        expect(arm?.content).not.toContain("<thinking>");
+        expect(arm?.content).not.toContain("let me consider the options");
+      });
+
+      it("retains a thinking-only turn with empty content rather than dropping it", () => {
+        const thinkingOnly = assistant("");
+        thinkingOnly.content = [{ type: "thinking", thinking: "still deciding" }];
+        const { history } = buildHistory([user("first"), thinkingOnly, user("second")], "M");
+        const arm = history.filter((h) => h.assistantResponseMessage);
+        expect(arm).toHaveLength(1);
+        expect(arm[0].assistantResponseMessage?.content).toBe("");
+        // Dropping it would collapse `first` and `second` into two consecutive
+        // user entries and break ALTERNATING_MESSAGES, which this provider now
+        // checks pre-send. `second` is the current message, so the invariant is
+        // only observable on the whole conversation.
+        const conversation = kiroConversationEntries(history, {
+          content: "second",
+          modelId: "M",
+          origin: "KIRO_CLI",
+        });
+        expect(validateKiroConversation(conversation).valid).toBe(true);
+      });
+
+      it("leaves toolUses untouched and content markup-free", () => {
+        const withBoth = assistant("");
+        withBoth.content = [
+          { type: "thinking", thinking: "need to compute" },
+          { type: "toolCall", id: "tc1", name: "calc", arguments: { expr: "2+2" } },
+        ];
+        const { history } = buildHistory([user("compute"), withBoth, toolResult("tc1", "4"), user("thanks")], "M");
+        const arm = history.find((h) => h.assistantResponseMessage)?.assistantResponseMessage;
+        expect(arm?.toolUses).toHaveLength(1);
+        expect(arm?.toolUses?.[0].toolUseId).toBe("tc1");
+        expect(arm?.content).not.toContain("<thinking>");
+        expect(arm?.content).not.toContain("need to compute");
+      });
+
+      it("still drops an assistant turn that carried no blocks at all", () => {
+        const empty = assistant("");
+        empty.content = [];
+        const { history } = buildHistory([user("hi"), empty], "M");
+        expect(history.filter((h) => h.assistantResponseMessage)).toHaveLength(0);
+      });
     });
   });
 });

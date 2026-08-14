@@ -168,22 +168,46 @@ export function buildHistory(
     } else if (msg.role === "assistant") {
       let armContent = "";
       const armToolUses: KiroToolUse[] = [];
+      // Tracks whether the turn had *any* block at all. A turn whose only block
+      // was thinking now yields `armContent === ""`, which the drop guard below
+      // would otherwise read as "nothing to say" and delete — silently removing a
+      // real turn and breaking ALTERNATING_MESSAGES for the very validator this
+      // provider now runs pre-send.
+      let armHadBlocks = false;
       if (Array.isArray(msg.content)) {
         for (const block of msg.content) {
-          if (block.type === "text") armContent += (block as TextContent).text;
-          else if (block.type === "thinking")
-            armContent = `<thinking>${(block as ThinkingContent).thinking}</thinking>\n\n${armContent}`;
-          else if (block.type === "toolCall") {
+          if (block.type === "text") {
+            armContent += (block as TextContent).text;
+            armHadBlocks = true;
+          } else if (block.type === "thinking") {
+            // Deliberately NOT serialized. Reasoning is excluded from the text
+            // channel, matching first-party Kiro Agent's `extractTextContent`
+            // (`q-client/q-developer-converse.ts`), which type-filters to
+            // `text` before joining. Flattening it to `<thinking>...</thinking>`
+            // wrote literal markup into the model's own remembered speech — a
+            // dialect this provider invented and then read back out again in
+            // `thinking-parser.ts`.
+            //
+            // Note the residual divergence: first-party does not discard
+            // reasoning, it carries it in a typed `assistantResponseMessage`
+            // `reasoningContent` field. This change reaches parity on the text
+            // channel only; adding that sidecar is separate work.
+            armHadBlocks = true;
+          } else if (block.type === "toolCall") {
             const tc = block as ToolCall;
             armToolUses.push({
               name: tc.name,
               toolUseId: tc.id,
               input: typeof tc.arguments === "string" ? JSON.parse(tc.arguments) : tc.arguments,
             });
+            armHadBlocks = true;
           }
         }
       }
-      if (!armContent && armToolUses.length === 0) continue;
+      // Drop only a turn that genuinely carried nothing. A thinking-only turn is
+      // retained with `content: ""`, which is what first-party sends for the same
+      // shape — `extractTextContent` returns `''` and the entry is still emitted.
+      if (!armContent && armToolUses.length === 0 && !armHadBlocks) continue;
       history.push({
         assistantResponseMessage: { content: armContent, ...(armToolUses.length > 0 ? { toolUses: armToolUses } : {}) },
       });

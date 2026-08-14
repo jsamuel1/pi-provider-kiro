@@ -36,7 +36,7 @@ import {
   HISTORY_LIMIT_CONTEXT_WINDOW,
   prepareHistory,
 } from "./history.js";
-import { isKiroToolStructureRule, kiroConversationEntries, validateKiroConversation } from "./history-validator.js";
+import { isKiroToolStructureRule, kiroConversationEntries, repairKiroConversation } from "./history-validator.js";
 import { getKiroCliCredentials, getKiroCliCredentialsAllowExpired, refreshViaKiroCli } from "./kiro-cli.js";
 import {
   invalidateKiroProfileArn,
@@ -438,28 +438,81 @@ export function streamKiro(
         // kiro-cli does not enforce alternation — the API accepts
         // non-alternating history. No synthetic padding needed.
         //
-        // Pre-send invariant check against the seven rules first-party Kiro
-        // Agent enforces. Diagnostic only: `prepareHistory` already repairs the
-        // shapes this provider produces, so a violation here is a shape it does
-        // not cover. Never thrown — failing closed would change behavior for
-        // callers whose histories send fine today. Tool-structure violations get
-        // a warning because the backend does reject those
-        // (`400 TOOL_USE_RESULT_MISMATCH`).
+        // Pre-send REPAIR against the seven rules first-party Kiro Agent
+        // enforces. `prepareHistory` covers the shapes this provider itself
+        // produces, but not every shape a caller can hand us: `sanitizeHistory`
+        // tests tool pairing by POSITION, so an assistant entry with `toolUses`
+        // survives whenever the next entry carries any `toolResults` at all,
+        // matching ids or not, and `injectSyntheticToolCalls` only rescues
+        // orphaned RESULTS. A mismatched pair — both partners present, paired
+        // with each other's counterpart — passes both passes untouched and is
+        // rejected on the wire with `400 TOOL_USE_RESULT_MISMATCH`.
+        //
+        // Observed 2026-08-14: a caller whose transcript interleaved two
+        // concurrent tool executions sent exactly that shape, and because the
+        // retry resends identical history the session was terminally wedged.
+        //
+        // Repair runs on the WHOLE conversation and is split back afterwards.
+        // Repairing `history` alone would be wrong in the ordinary case: its
+        // last entry is normally the assistant whose `toolUses` this very
+        // request answers, so rule 4 would synthesize a FAILED result for a call
+        // whose real output is sitting in the current message.
+        //
+        // Still never throws. `remaining` is what repair could not express, and
+        // that — not merely "input was invalid" — is what earns the warning.
         const conversationEntries = kiroConversationEntries(history, {
           content: currentContent,
           modelId: kiroModelId,
           origin: "KIRO_CLI",
           ...(uimc ? { userInputMessageContext: uimc } : {}),
         });
-        const invariants = validateKiroConversation(conversationEntries);
-        if (!invariants.valid) {
-          debugLog("request.invariants", { errors: invariants.errors });
-          const structural = invariants.errors.filter((e) => isKiroToolStructureRule(e.rule));
+        const repair = repairKiroConversation(conversationEntries);
+        if (repair.diagnostics.length > 0) {
+          debugLog("request.invariants", { errors: repair.diagnostics, remaining: repair.remaining });
+        }
+        // Split back. Repair moves entries in only three ways, and each one keeps
+        // the current message last:
+        //   - step 1 drops a prefix, never a suffix;
+        //   - step 4 inserts a synthetic user turn only AFTER an assistant whose
+        //     uses nothing answers, and the current message is a user entry, so
+        //     no assistant is ever last;
+        //   - steps 2/3/5 rewrite entries in place.
+        // The one exception is total collapse: a conversation that is *only* a
+        // bare tool-result carrier has no valid opening entry, so step 1 consumes
+        // it and returns nothing. Because step 1 cannot skip past a survivor,
+        // `entries.length === 0` is the only shape where the current message is
+        // gone — anything longer keeps it at the end.
+        const repairedCurrent = repair.entries[repair.entries.length - 1]?.userInputMessage;
+        // `currentImages` is carried separately below and is not part of the
+        // repaired projection, so only text + context are read back here.
+        //
+        // Read the repaired context EXACTLY, including when repair removed it.
+        // A `?? uimc` fallback here would undo the repair in the one case that
+        // matters most: stripping every orphaned tool result leaves a turn with
+        // no context at all, and falling back would put the orphans — the shape
+        // the backend rejects — straight back onto the wire.
+        let wireHistory: KiroHistoryEntry[];
+        let wireContent: string;
+        let wireUimc: typeof uimc;
+        if (repairedCurrent) {
+          wireHistory = repair.entries.slice(0, -1);
+          wireContent = repairedCurrent.content;
+          wireUimc = repairedCurrent.userInputMessageContext;
+        } else {
+          // Collapsed. Apply what repair would have applied to a lone carrier:
+          // drop the results that answer nothing (steps 3), keep any tool
+          // catalog, and give the empty turn the neutral prompt (step 5).
+          wireHistory = [];
+          wireContent = currentContent || EMPTY_CONTENT_PLACEHOLDER;
+          wireUimc = uimc?.tools?.length ? { tools: uimc.tools } : undefined;
+        }
+        if (repair.remaining.length > 0) {
+          const structural = repair.remaining.filter((e) => isKiroToolStructureRule(e.rule));
           if (structural.length > 0) {
             console.warn(
-              `[pi-provider-kiro] outbound history violates ${structural
+              `[pi-provider-kiro] outbound history still violates ${structural
                 .map((e) => `${e.rule}@${e.index}`)
-                .join(", ")} — Kiro may reject this request`,
+                .join(", ")} after repair — Kiro may reject this request`,
             );
           }
         }
@@ -470,14 +523,14 @@ export function streamKiro(
             conversationId,
             currentMessage: {
               userInputMessage: {
-                content: sanitizeSurrogates(currentContent),
+                content: sanitizeSurrogates(wireContent),
                 modelId: kiroModelId,
                 origin: "KIRO_CLI",
                 ...(currentImages ? { images: currentImages } : {}),
-                ...(uimc ? { userInputMessageContext: uimc } : {}),
+                ...(wireUimc ? { userInputMessageContext: wireUimc } : {}),
               },
             },
-            ...(history.length > 0 ? { history } : {}),
+            ...(wireHistory.length > 0 ? { history: wireHistory } : {}),
           },
           ...(additionalModelRequestFields ? { additionalModelRequestFields } : {}),
           profileArn,
@@ -493,10 +546,14 @@ export function streamKiro(
           debugLog("request.send", {
             attempt: retryCount,
             capacityAttempt: capacityRetryCount,
-            historyLen: history.length,
-            currentContentLen: currentContent.length,
+            // Wire values, not pre-repair ones: this line is what a reader
+            // correlates against a 400, so it must describe the bytes actually
+            // sent. `toolResultCount` likewise counts the repaired carrier,
+            // which may include synthesized results the raw turn never had.
+            historyLen: wireHistory.length,
+            currentContentLen: wireContent.length,
             hasImages: !!currentImages,
-            toolResultCount: currentToolResults.length,
+            toolResultCount: wireUimc?.toolResults?.length ?? 0,
             request,
           });
           response = await fetch(endpoint, {

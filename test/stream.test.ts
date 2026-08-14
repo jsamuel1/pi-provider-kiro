@@ -11,6 +11,7 @@ import type {
 import { isContextOverflow } from "@earendil-works/pi-ai/compat";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { findJsonEnd } from "../src/bracket-tool-parser.js";
+import { KiroValidationRule, validateKiroConversation, validateKiroToolStructure } from "../src/history-validator.js";
 import { capacityRetryConfig, retryConfig } from "../src/retry.js";
 import { resetProfileArnCache, streamKiro } from "../src/stream.js";
 import { EMPTY_CONTENT_PLACEHOLDER, type KiroHistoryEntry } from "../src/transform.js";
@@ -1542,24 +1543,173 @@ describe("Feature 9: Streaming Integration", () => {
   });
 
   // -----------------------------------------------------------------------
-  // The pre-send invariant check, exercised through `streamKiro` rather than
-  // through `validateKiroConversation` directly. Unit tests on the validator
-  // prove the rules; only these prove the request builder actually runs them.
+  // The pre-send REPAIR, exercised through `streamKiro` rather than through
+  // `repairKiroConversation` directly. Unit tests on the validator prove the
+  // rules; only these prove the request builder actually runs them and sends
+  // the repaired bytes.
   //
   // MUTATION PROBE: delete the `kiroConversationEntries`/
-  // `validateKiroConversation` block in stream.ts and the first of these goes
-  // red. Nothing else in the suite does — `tsc` still passes and biome reports
-  // the orphaned imports as a warning with exit 0.
+  // `repairKiroConversation` block in stream.ts and these go red. Nothing else
+  // in the suite does — `tsc` still passes and biome reports the orphaned
+  // imports as a warning with exit 0.
   //
   // Reachability: `sanitizeHistory` repairs orphaned results inside `history`
-  // by synthesizing an `unknown_tool` toolUse, but the current message is
-  // assembled after that pass and is not covered by it. A tool result whose id
-  // matches no toolUse in the preceding assistant entry therefore survives to
-  // the check — the same shape the backend rejects as
-  // `400 TOOL_USE_RESULT_MISMATCH`.
+  // by synthesizing an `unknown_tool` toolUse, but it tests pairing by POSITION,
+  // so a mismatched PAIR — both partners present, each paired with the other's
+  // counterpart — passes it untouched, and the current message is assembled
+  // after that pass and is not covered by it at all. Both shapes reach the wire
+  // as `400 TOOL_USE_RESULT_MISMATCH` unless repaired here.
   // -----------------------------------------------------------------------
 
-  it("warns when the outbound tool structure violates an invariant", async () => {
+  // -----------------------------------------------------------------------
+  // The live wedge, 2026-08-14. Two concurrent tool executions interleaved into
+  // one transcript, so a tool result landed paired with the WRONG assistant's
+  // tool use:
+  //
+  //   assistant(toolUses=[A]) / user(text) / assistant(toolUses=[B]) / user(results=[A])
+  //
+  // Kiro answered `400 ... tool_use ids were found without tool_result blocks
+  // immediately after: <B>` and, because the retry resends identical history,
+  // the session was terminally wedged — every subsequent turn 400d.
+  //
+  // `prepareHistory` cannot see it: `sanitizeHistory` tests pairing by POSITION,
+  // and `injectSyntheticToolCalls` only rescues orphaned RESULTS.
+  // -----------------------------------------------------------------------
+  // The branch where repair legitimately removes `userInputMessageContext`
+  // entirely: the carrier's results answer nothing, and the turn declares no
+  // tools, so after stripping there is nothing left to put in the context. This
+  // is the shape a `?? uimc` fallback silently undoes.
+  //
+  // No tools are declared and history contains no `toolUses`, so
+  // `addPlaceholderTools` synthesizes none either — that is what makes the
+  // repaired context empty rather than tools-only.
+  //
+  // MUTATION PROBE: change `wireUimc = repairedCurrent.userInputMessageContext`
+  // to `... ?? uimc` in stream.ts and this goes red — the stripped orphan is put
+  // straight back onto the wire.
+  it("sends no tool context at all when repair strips the only results", async () => {
+    const settledAssistant: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "Done." }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "stop",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: "do it", timestamp: ts },
+        settledAssistant,
+        // Answers `tcZ`, which no assistant turn ever issued.
+        {
+          role: "toolResult",
+          toolCallId: "tcZ",
+          toolName: "calc",
+          content: [{ type: "text", text: "orphan" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const current = sent.conversationState.currentMessage.userInputMessage;
+    expect(current.userInputMessageContext).toBeUndefined();
+    // With no payload left, step 5 gives the turn the neutral prompt.
+    expect(current.content).toBe(EMPTY_CONTENT_PLACEHOLDER);
+    const conversation = [...(sent.conversationState.history ?? []), { userInputMessage: current }];
+    expect(validateKiroConversation(conversation).valid).toBe(true);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("repairs the live mismatched-pair wedge so it no longer earns a 400", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: "build it", timestamp: ts },
+        makeToolCall("A"),
+        { role: "user", content: "continue", timestamp: ts },
+        makeToolCall("B"),
+        {
+          role: "toolResult",
+          toolCallId: "A",
+          toolName: "read",
+          content: [{ type: "text", text: "REAL_OUTPUT_A" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "read", description: "Read", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const current = sent.conversationState.currentMessage.userInputMessage;
+    const conversation = [...(sent.conversationState.history ?? []), { userInputMessage: current }];
+
+    // The 400 is gone. `B` — the toolUse the backend named — is answered, and no
+    // result answering nothing is left on the wire. This is the whole point: the
+    // request is now one the backend accepts, so the session is not wedged.
+    expect(validateKiroToolStructure(conversation).valid).toBe(true);
+    expect(current.userInputMessageContext.toolResults).toHaveLength(1);
+    expect(current.userInputMessageContext.toolResults[0].toolUseId).toBe("B");
+    expect(current.userInputMessageContext.toolResults[0].status).toBe("error");
+    // `B` is answered rather than dropped, so the model still sees that its call
+    // was issued and did not complete.
+    const armToolUses = (sent.conversationState.history ?? []).flatMap(
+      (h: KiroHistoryEntry) => h.assistantResponseMessage?.toolUses ?? [],
+    );
+    expect(armToolUses.map((tu: { toolUseId: string }) => tu.toolUseId)).toContain("B");
+
+    // ---- Two documented divergences from this card's amendment. ----
+    //
+    // 1. `A`'s real output does NOT survive. The amendment expected repair to
+    //    preserve it. It cannot, and the reason is ordering: `prepareHistory`
+    //    runs first and `sanitizeHistory` drops `assistant(toolUses=[A])`
+    //    positionally (its next entry is the `continue` interjection, which
+    //    carries no results), so by the time repair sees the conversation, `A`'s
+    //    use exists nowhere and its result answers nothing.
+    //
+    //    Repairing raw history instead is worse, not better: repair would then
+    //    top up the real `continue` message with a synthetic failed result for
+    //    `A`, fabricating tool output onto a message the user actually wrote, and
+    //    `A`'s real result would still be stripped one step later.
+    //
+    //    Preserving it needs a capability repair does not have — relocating a
+    //    displaced result behind a re-declaration of its use — which means either
+    //    reordering conversation chronology or putting the same `toolUseId` on
+    //    the wire twice. Neither is probed. Pinned here so the loss is a stated
+    //    behavior rather than a silent one.
+    expect(JSON.stringify(sent)).not.toContain("REAL_OUTPUT_A");
+    //
+    // 2. The repaired conversation is NOT valid under all seven rules. The
+    //    interjection leaves two consecutive user entries, and repair has no
+    //    alternation pass. That is deliberate: this provider documents that the
+    //    API accepts non-alternating history, and it is not a tool-structure
+    //    rule, so it stays in `remaining` and is not warned about.
+    const residual = validateKiroConversation(conversation).errors;
+    expect(residual.map((e) => e.rule)).toEqual([KiroValidationRule.ALTERNATING_MESSAGES]);
+    const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(warned).not.toContain("outbound history");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("repairs an outbound tool structure that violates an invariant", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const assistantWithTool: AssistantMessage = {
       role: "assistant",
@@ -1593,11 +1743,21 @@ describe("Feature 9: Streaming Integration", () => {
 
     await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
 
+    // Repaired, not merely reported: the orphan `tcZ` result is stripped and
+    // `tcA` — which nothing answered — gets a synthetic failure result, so the
+    // conversation that reaches the wire satisfies all seven rules.
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const conversation = [
+      ...(sent.conversationState.history ?? []),
+      { userInputMessage: sent.conversationState.currentMessage.userInputMessage },
+    ];
+    expect(validateKiroConversation(conversation).valid).toBe(true);
+    const sentResults = sent.conversationState.currentMessage.userInputMessage.userInputMessageContext?.toolResults;
+    expect(sentResults?.map((tr: { toolUseId: string }) => tr.toolUseId)).toEqual(["tcA"]);
+    expect(sentResults?.[0].status).toBe("error");
+    // Nothing survived repair, so nothing is warned about.
     const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
-    expect(warned).toContain("outbound history violates");
-    expect(warned).toMatch(/TOOL_USES_AND_RESULTS|TOOL_RESULTS_ORPHAN_IDS/);
-    // Diagnostic only — the request still goes out.
-    expect(mockFetch).toHaveBeenCalled();
+    expect(warned).not.toContain("outbound history");
 
     warnSpy.mockRestore();
     vi.unstubAllGlobals();
@@ -1637,7 +1797,7 @@ describe("Feature 9: Streaming Integration", () => {
     await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
 
     const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
-    expect(warned).not.toContain("outbound history violates");
+    expect(warned).not.toContain("outbound history");
 
     warnSpy.mockRestore();
     vi.unstubAllGlobals();
@@ -1649,9 +1809,15 @@ describe("Feature 9: Streaming Integration", () => {
   // `TOOL_USE_RESULT_MISMATCH` — while the invariant check stayed silent, because
   // the pairwise walk only inspects a carrier that follows an assistant entry.
   //
-  // MUTATION PROBE: drop the unpaired-carrier pass at the end of
-  // `validateToolUsesAndResults` and this goes red.
-  it("warns when a tool-result carrier has no toolUse anywhere", async () => {
+  // It is now repaired rather than warned about. This is also the one shape that
+  // repair COLLAPSES: the whole conversation is a single bare carrier, so step 1
+  // finds no valid opening entry and consumes it. `stream.ts` handles that
+  // explicitly — strip the results that answer nothing, keep the tool catalog,
+  // and fall back to the neutral prompt.
+  //
+  // MUTATION PROBE: restore `wireUimc = repairedCurrent?.userInputMessageContext ?? uimc`
+  // and this goes red — the fallback puts the stripped orphan straight back.
+  it("repairs a tool-result carrier that has no toolUse anywhere", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const context: Context = {
       systemPrompt: "You are helpful",
@@ -1678,14 +1844,16 @@ describe("Feature 9: Streaming Integration", () => {
       }),
     );
 
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const currentMsg = sent.conversationState.currentMessage.userInputMessage;
+    // The orphan is gone — sending it is what earns the 400.
+    expect(currentMsg.userInputMessageContext?.toolResults ?? []).toHaveLength(0);
+    // The tool catalog survives, and the turn still has a payload.
+    expect(currentMsg.userInputMessageContext?.tools).toBeDefined();
+    expect(currentMsg.content).toBe(EMPTY_CONTENT_PLACEHOLDER);
+    expect(sent.conversationState.history ?? []).toHaveLength(0);
     const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
-    expect(warned).toContain("outbound history violates");
-    expect(warned).toContain("TOOL_RESULTS_AND_NO_USES");
-    // Diagnostic only — the request still goes out.
-    const body = mockFetch.mock.calls[0][1].body as string;
-    expect(
-      JSON.parse(body).conversationState.currentMessage.userInputMessage.userInputMessageContext.toolResults,
-    ).toHaveLength(1);
+    expect(warned).not.toContain("outbound history");
 
     warnSpy.mockRestore();
     vi.unstubAllGlobals();
