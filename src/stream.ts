@@ -37,6 +37,7 @@ import {
   prepareHistory,
 } from "./history.js";
 import { isKiroToolStructureRule, kiroConversationEntries, repairKiroConversation } from "./history-validator.js";
+import { parseInvokeToolCalls } from "./invoke-tool-parser.js";
 import { getKiroCliCredentials, getKiroCliCredentialsAllowExpired, refreshViaKiroCli } from "./kiro-cli.js";
 import {
   invalidateKiroProfileArn,
@@ -894,14 +895,30 @@ export function streamKiro(
           thinkingParser.finalize();
           textBlockIndex = thinkingParser.getTextBlockIndex();
         }
-        // Fallback: extract bracket-style tool calls from content if no native tool calls
+        // Fallback: extract text-dialect tool calls from content if no native
+        // tool calls arrived. Two dialects are recovered at this seam:
+        //   1. Kiro's own `[Called name with args: {...}]` bracket form.
+        //   2. Anthropic's `<invoke name="..."><parameter .../></invoke>` XML
+        //      form, which opus-class models emit as plain text at high context.
+        // Without this, the turn ends `stopReason:"stop"` with zero tool calls —
+        // the agent loop sees a finished answer and an unattended session stalls
+        // indefinitely with no error recorded anywhere.
         if (!sawAnyToolCalls && textBlockIndex !== null) {
           const textBlock = output.content[textBlockIndex] as TextContent;
+          const recovered: Array<{ toolUseId: string; name: string; arguments: Record<string, unknown> }> = [];
           const bracketResult = parseBracketToolCalls(textBlock.text);
           if (bracketResult.toolCalls.length > 0) {
-            sawAnyToolCalls = true;
             textBlock.text = bracketResult.cleanedText;
-            for (const btc of bracketResult.toolCalls) {
+            recovered.push(...bracketResult.toolCalls);
+          }
+          const invokeResult = parseInvokeToolCalls(textBlock.text);
+          if (invokeResult.toolCalls.length > 0) {
+            textBlock.text = invokeResult.cleanedText;
+            recovered.push(...invokeResult.toolCalls);
+          }
+          if (recovered.length > 0) {
+            sawAnyToolCalls = true;
+            for (const btc of recovered) {
               if (
                 emitToolCall(
                   {

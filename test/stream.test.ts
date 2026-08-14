@@ -16,6 +16,7 @@ import { capacityRetryConfig, retryConfig } from "../src/retry.js";
 import { resetProfileArnCache, streamKiro } from "../src/stream.js";
 import { EMPTY_CONTENT_PLACEHOLDER, type KiroHistoryEntry } from "../src/transform.js";
 import { concatMessages, encodeEventMessage } from "./helpers/event-stream.js";
+import { RECORD_279_COMMAND, RECORD_279_SUMMARY, RECORD_279_TEXT } from "./helpers/invoke-fixture.js";
 
 const ts = Date.now();
 const zeroUsage = {
@@ -3347,6 +3348,107 @@ describe("Feature 9: Streaming Integration", () => {
     const toolCalls = msg?.content.filter((b) => b.type === "toolCall");
     expect(toolCalls).toHaveLength(1);
     expect(toolCalls?.[0].type === "toolCall" && toolCalls?.[0].name).toBe("bash");
+
+    vi.unstubAllGlobals();
+  });
+
+  // =========================================================================
+  // XML-dialect tool call recovery (<invoke name="...">)
+  // =========================================================================
+
+  it("recovers an XML-dialect tool call and returns stopReason toolUse (record 279)", async () => {
+    // Reproduces the observed stall: the model emitted its shell call as text in
+    // Anthropic's XML function-calling dialect, so the turn ended
+    // stopReason:"stop" with zero toolCall blocks and the agent loop parked at
+    // the prompt. The assertion that matters is the stopReason flip — that is
+    // what keeps an unattended session moving.
+    const mockFetch = mockFetchOk(`${JSON.stringify({ content: RECORD_279_TEXT })}{"contextUsagePercentage":10}`);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+
+    const toolCalls = msg?.content.filter((b) => b.type === "toolCall");
+    expect(toolCalls).toHaveLength(1);
+    const call = toolCalls?.[0];
+    expect(call?.type === "toolCall" && call.name).toBe("shell");
+    // Byte-exact all the way through JSON.stringify → emitToolCall → JSON.parse.
+    expect(call?.type === "toolCall" && call.arguments.command).toBe(RECORD_279_COMMAND);
+    expect(call?.type === "toolCall" && call.arguments.summary).toBe(RECORD_279_SUMMARY);
+
+    const textBlock = msg?.content.find((b) => b.type === "text");
+    expect(textBlock?.type === "text" && textBlock.text).not.toContain("<invoke name=");
+
+    // The fix: "stop" would stall the agent loop; "toolUse" continues it.
+    expect(done?.type === "done" && done.reason).toBe("toolUse");
+    expect(msg?.stopReason).toBe("toolUse");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("recovers XML-dialect calls split across stream chunks", async () => {
+    // The dialect arrives as ordinary content deltas, so a tag can straddle a
+    // chunk boundary. Recovery runs on the assembled text block, after the
+    // stream ends, so boundaries must not matter.
+    const mid = Math.floor(RECORD_279_TEXT.length / 2);
+    const mockFetch = mockFetchChunked([
+      JSON.stringify({ content: RECORD_279_TEXT.slice(0, mid) }),
+      JSON.stringify({ content: RECORD_279_TEXT.slice(mid) }),
+      '{"contextUsagePercentage":10}',
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    const toolCalls = msg?.content.filter((b) => b.type === "toolCall");
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls?.[0].type === "toolCall" && toolCalls?.[0].arguments.command).toBe(RECORD_279_COMMAND);
+    expect(done?.type === "done" && done.reason).toBe("toolUse");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("does not recover XML-dialect calls when native tool calls exist", async () => {
+    const toolPayload = '{"name":"bash","toolUseId":"tc1","input":"{\\"cmd\\":\\"ls\\"}","stop":true}';
+    const mockFetch = mockFetchOk(
+      `${JSON.stringify({ content: RECORD_279_TEXT })}${toolPayload}{"contextUsagePercentage":10}`,
+    );
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    const toolCalls = msg?.content.filter((b) => b.type === "toolCall");
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls?.[0].type === "toolCall" && toolCalls?.[0].name).toBe("bash");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("leaves prose that merely quotes the dialect alone", async () => {
+    // Model output analysing this bug quotes the dialect inside a code fence.
+    // Recovering from that would execute a command out of documentation.
+    const prose = ["The leak looks like:", "```", RECORD_279_TEXT, "```", "Want me to file a card?"].join("\n");
+    const mockFetch = mockFetchOk(`${JSON.stringify({ content: prose })}{"contextUsagePercentage":10}`);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg?.content.filter((b) => b.type === "toolCall")).toHaveLength(0);
+    const textBlock = msg?.content.find((b) => b.type === "text");
+    expect(textBlock?.type === "text" && textBlock.text).toBe(prose);
+    expect(done?.type === "done" && done.reason).toBe("stop");
 
     vi.unstubAllGlobals();
   });
