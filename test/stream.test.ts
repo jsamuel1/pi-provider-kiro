@@ -1631,6 +1631,103 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
+  it("does not flatten reasoning into the current turn's assistant content", async () => {
+    // The history site (`buildHistory`) stopped flattening earlier; this is the
+    // OTHER site, in the current-message assistant branch. It reaches the wire
+    // through the same `assistantResponseMessage.content`, so leaving it flattened
+    // made the parity claim only half true.
+    const withThinking: AssistantMessage = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "deciding which file to read" } as unknown as TextContent,
+        { type: "text", text: "reading it now" },
+        { type: "toolCall", id: "tc9", name: "read", arguments: { path: "/tmp/tc9" } },
+      ],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    } as AssistantMessage;
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [...settledTurn(), withThinking, makeToolResult("tc9")],
+      tools: [{ name: "read", description: "Read", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const entry = (sent.conversationState.history ?? []).find((h: KiroHistoryEntry) =>
+      h.assistantResponseMessage?.toolUses?.some((tu) => tu.toolUseId === "tc9"),
+    );
+    expect(entry).toBeDefined();
+    // The reasoning is gone from the text channel, the real text survives, and the
+    // structured tool use is untouched.
+    expect(entry?.assistantResponseMessage?.content).not.toContain("<thinking>");
+    expect(entry?.assistantResponseMessage?.content).not.toContain("deciding which file to read");
+    expect(entry?.assistantResponseMessage?.content).toContain("reading it now");
+    expect(entry?.assistantResponseMessage?.toolUses?.[0]?.name).toBe("read");
+    // Nothing anywhere in the request carries the markup.
+    expect(JSON.stringify(sent)).not.toContain("<thinking>");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("does not append a bare separator when merging an empty current turn into a previous assistant", async () => {
+    // A current turn carrying only a toolCall leaves `armContent === ""`. Merging
+    // that into the preceding assistant with an unconditional `\n\n` appends a
+    // dangling separator onto text the model actually produced.
+    //
+    // Reaching the merge branch needs the LAST history entry to be an assistant
+    // with no `userInputMessage`, so the fixture puts two assistant turns back to
+    // back with no tool result between them. A tool-result carrier in between ends
+    // history on a user entry and takes the push branch instead, which is what an
+    // earlier version of this test did — it passed against the unconditional
+    // separator and proved nothing.
+    const plainAssistant: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "earlier answer" }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "stop",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: "go", timestamp: ts },
+        plainAssistant,
+        makeToolCall("tcB"),
+        makeToolResult("tcB"),
+      ],
+      tools: [{ name: "read", description: "Read", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const merged = (sent.conversationState.history ?? []).find((h: KiroHistoryEntry) =>
+      h.assistantResponseMessage?.toolUses?.some((tu) => tu.toolUseId === "tcB"),
+    );
+    // The merge happened onto the real text, and it is byte-identical.
+    expect(merged?.assistantResponseMessage?.content).toBe("earlier answer");
+    for (const entry of sent.conversationState.history ?? []) {
+      const content = entry.assistantResponseMessage?.content;
+      if (typeof content !== "string") continue;
+      expect(content).not.toMatch(/\n\n$/);
+    }
+
+    vi.unstubAllGlobals();
+  });
+
   it("repairs the live mismatched-pair wedge so it no longer earns a 400", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const context: Context = {

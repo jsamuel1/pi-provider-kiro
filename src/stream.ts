@@ -331,8 +331,17 @@ export function streamKiro(
           if (Array.isArray(am.content))
             for (const b of am.content) {
               if (b.type === "text") armContent += (b as TextContent).text;
-              else if (b.type === "thinking")
-                armContent = `<thinking>${(b as unknown as { thinking: string }).thinking}</thinking>\n\n${armContent}`;
+              // Reasoning is deliberately NOT serialized into the assistant text
+              // channel, matching `buildHistory` and first-party
+              // `extractTextContent`, which type-filters to `text`. Flattening it
+              // to `<thinking>...</thinking>` writes literal markup into the
+              // string the model reads back as its own prior speech.
+              //
+              // Unlike the history site, this needs no "turn had blocks" guard:
+              // `currentMsgStartIdx` increments past an assistant that declares no
+              // `toolCall`, so reaching this branch at all means one exists and
+              // `armToolUses` is non-empty. The guard below therefore cannot drop
+              // the entry when reasoning is excluded.
               else if (b.type === "toolCall") {
                 const tc = b as ToolCall;
                 armToolUses.push({
@@ -349,8 +358,13 @@ export function streamKiro(
             const lastEntryForArm = history[history.length - 1];
             const prevArm = lastEntryForArm?.assistantResponseMessage;
             if (history.length > 0 && !lastEntryForArm?.userInputMessage && prevArm) {
-              // Merge into previous assistant message to maintain alternation without synthetic padding
-              prevArm.content += `\n\n${armContent}`;
+              // Merge into previous assistant message to maintain alternation
+              // without synthetic padding. Join only non-empty sides: a turn that
+              // carried only reasoning or only a tool call leaves `armContent`
+              // empty, and an unconditional separator would append a bare `\n\n`
+              // onto text the model actually produced.
+              prevArm.content =
+                prevArm.content && armContent ? `${prevArm.content}\n\n${armContent}` : prevArm.content || armContent;
               if (armToolUses.length > 0) prevArm.toolUses = [...(prevArm.toolUses || []), ...armToolUses];
             } else {
               history.push({
