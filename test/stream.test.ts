@@ -836,9 +836,9 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
-  it("preserves an empty later thinking region through the streamed response", async () => {
+  it("preserves empty first and later thinking regions through the streamed response", async () => {
     const mockFetch = mockFetchChunked([
-      '{"content":"<thinking>first</thinking>mid<rea"}',
+      '{"content":"<thought></thought>mid<rea"}',
       '{"content":"soning></reasoning>end"}',
       '{"contextUsagePercentage":15}',
     ]);
@@ -851,7 +851,7 @@ describe("Feature 9: Streaming Integration", () => {
 
     expect(thinkingStarts.map((event) => event.contentIndex)).toEqual([0, 2]);
     expect(thinkingEnds.map((event) => event.contentIndex)).toEqual([0, 2]);
-    expect(thinkingEnds.map((event) => event.content)).toEqual(["first", ""]);
+    expect(thinkingEnds.map((event) => event.content)).toEqual(["", ""]);
 
     const textDeltas = events
       .filter((event) => event.type === "text_delta")
@@ -865,7 +865,7 @@ describe("Feature 9: Streaming Integration", () => {
     const done = events.find((event) => event.type === "done");
     const content = done?.type === "done" ? done.message.content : [];
     expect(content).toEqual([
-      { type: "thinking", thinking: "first" },
+      { type: "thinking", thinking: "" },
       { type: "text", text: "mid" },
       { type: "thinking", thinking: "" },
       { type: "text", text: "end" },
