@@ -796,6 +796,45 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
+  it("preserves multiple thinking regions through the streamed response", async () => {
+    const mockFetch = mockFetchChunked([
+      '{"content":"<thinking>first</thinking>\\n\\nmid<rea"}',
+      '{"content":"soning>second</reasoning>\\n\\nend"}',
+      '{"contextUsagePercentage":15}',
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: true }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const thinkingStarts = events.filter((event) => event.type === "thinking_start");
+    const thinkingEnds = events.filter((event) => event.type === "thinking_end");
+
+    expect(thinkingStarts.map((event) => event.contentIndex)).toEqual([0, 2]);
+    expect(thinkingEnds.map((event) => event.contentIndex)).toEqual([0, 2]);
+    expect(thinkingEnds.map((event) => event.content)).toEqual(["first", "second"]);
+
+    const textDeltas = events
+      .filter((event) => event.type === "text_delta")
+      .map((event) => event.delta)
+      .join("");
+    expect(textDeltas).toBe("midend");
+    expect(textDeltas).not.toMatch(/<\/?(?:thinking|think|reasoning|thought)>/);
+
+    const textEnd = events.find((event) => event.type === "text_end");
+    expect(textEnd?.type === "text_end" && [textEnd.contentIndex, textEnd.content]).toEqual([3, "end"]);
+
+    const done = events.find((event) => event.type === "done");
+    const content = done?.type === "done" ? done.message.content : [];
+    expect(content).toEqual([
+      { type: "thinking", thinking: "first" },
+      { type: "text", text: "mid" },
+      { type: "thinking", thinking: "second" },
+      { type: "text", text: "end" },
+    ]);
+
+    vi.unstubAllGlobals();
+  });
+
   it("does not withhold the tail of plain text in reasoning mode", async () => {
     const mockFetch = mockFetchChunked(['{"content":"Hello world"}', '{"contextUsagePercentage":5}']);
     vi.stubGlobal("fetch", mockFetch);
