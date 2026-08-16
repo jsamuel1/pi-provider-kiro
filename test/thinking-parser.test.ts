@@ -279,6 +279,34 @@ describe("Feature 7: Thinking Tag Parser", () => {
     expect(events.filter((e) => e.type === "thinking_start")).toHaveLength(2);
   });
 
+  it("preserves an empty later region as its own thinking block", () => {
+    const output = makeOutput();
+    const stream = createAssistantMessageEventStream();
+    const parser = new ThinkingTagParser(output, stream);
+
+    parser.processChunk("<thinking>a</thinking>mid<reasoning></reasoning>end");
+    parser.finalize();
+    stream.end();
+
+    expect(output.content).toEqual([
+      { type: "thinking", thinking: "a" },
+      { type: "text", text: "mid" },
+      { type: "thinking", thinking: "" },
+      { type: "text", text: "end" },
+    ]);
+  });
+
+  it("emits start and end events for an empty region", async () => {
+    const events = await run(["<thinking>a</thinking>mid<thou", "ght></thought>end"]);
+    const thinkingStarts = events.filter((event) => event.type === "thinking_start");
+    const thinkingEnds = events.filter((event) => event.type === "thinking_end");
+
+    expect(thinkingStarts.map((event) => event.contentIndex)).toEqual([0, 2]);
+    expect(thinkingEnds.map((event) => event.contentIndex)).toEqual([0, 2]);
+    expect(thinkingEnds.map((event) => event.content)).toEqual(["a", ""]);
+    expect(deltas(events, "text_delta")).toBe("midend");
+  });
+
   it("getTextBlockIndex points at the last text block across regions", () => {
     const output = makeOutput();
     const stream = createAssistantMessageEventStream();

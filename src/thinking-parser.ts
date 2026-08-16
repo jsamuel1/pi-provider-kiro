@@ -40,8 +40,8 @@ export class ThinkingTagParser {
   private inThinking = false;
   /**
    * True once a thinking region has closed. Only gates the hoist in
-   * `emitThinking()` — a message may contain any number of thinking regions,
-   * so this must never stop later open tags from being recognized.
+   * `ensureThinkingBlock()` — a message may contain any number of thinking
+   * regions, so this must never stop later open tags from being recognized.
    */
   private thinkingBlockEmitted = false;
   private thinkingBlockIndex: number | null = null;
@@ -131,15 +131,14 @@ export class ThinkingTagParser {
     const endPos = this.textBuffer.indexOf(this.activeEndTag);
     if (endPos !== -1) {
       if (endPos > 0) this.emitThinking(this.textBuffer.slice(0, endPos));
-      if (this.thinkingBlockIndex !== null) {
-        const block = this.output.content[this.thinkingBlockIndex] as ThinkingContent;
-        this.stream.push({
-          type: "thinking_end",
-          contentIndex: this.thinkingBlockIndex,
-          content: block.thinking,
-          partial: this.output,
-        });
-      }
+      const thinkingBlockIndex = this.ensureThinkingBlock();
+      const block = this.output.content[thinkingBlockIndex] as ThinkingContent;
+      this.stream.push({
+        type: "thinking_end",
+        contentIndex: thinkingBlockIndex,
+        content: block.thinking,
+        partial: this.output,
+      });
       this.textBuffer = this.textBuffer.slice(endPos + this.activeEndTag.length);
       this.inThinking = false;
       this.thinkingBlockEmitted = true;
@@ -176,29 +175,33 @@ export class ThinkingTagParser {
     this.stream.push({ type: "text_delta", contentIndex: this.textBlockIndex, delta: text, partial: this.output });
   }
 
+  private ensureThinkingBlock(): number {
+    if (this.thinkingBlockIndex !== null) return this.thinkingBlockIndex;
+    if (this.textBlockIndex !== null && !this.thinkingBlockEmitted) {
+      // Thinking arrived after text was already emitted (Kiro API sends
+      // text before thinking content). Insert the thinking block before
+      // the text block so the content array order is thinking → text.
+      // Only the first region may hoist: once a region has closed, any
+      // preceding text genuinely came first and must keep its position.
+      this.thinkingBlockIndex = this.textBlockIndex;
+      this.output.content.splice(this.thinkingBlockIndex, 0, { type: "thinking", thinking: "" });
+      this.textBlockIndex = this.textBlockIndex + 1;
+    } else {
+      this.thinkingBlockIndex = this.output.content.length;
+      this.output.content.push({ type: "thinking", thinking: "" });
+    }
+    this.stream.push({ type: "thinking_start", contentIndex: this.thinkingBlockIndex, partial: this.output });
+    return this.thinkingBlockIndex;
+  }
+
   private emitThinking(thinking: string): void {
     if (!thinking) return;
-    if (this.thinkingBlockIndex === null) {
-      if (this.textBlockIndex !== null && !this.thinkingBlockEmitted) {
-        // Thinking arrived after text was already emitted (Kiro API sends
-        // text before thinking content). Insert the thinking block before
-        // the text block so the content array order is thinking → text.
-        // Only the first region may hoist: once a region has closed, any
-        // preceding text genuinely came first and must keep its position.
-        this.thinkingBlockIndex = this.textBlockIndex;
-        this.output.content.splice(this.thinkingBlockIndex, 0, { type: "thinking", thinking: "" });
-        this.textBlockIndex = this.textBlockIndex + 1;
-      } else {
-        this.thinkingBlockIndex = this.output.content.length;
-        this.output.content.push({ type: "thinking", thinking: "" });
-      }
-      this.stream.push({ type: "thinking_start", contentIndex: this.thinkingBlockIndex, partial: this.output });
-    }
-    const block = this.output.content[this.thinkingBlockIndex] as ThinkingContent;
+    const thinkingBlockIndex = this.ensureThinkingBlock();
+    const block = this.output.content[thinkingBlockIndex] as ThinkingContent;
     block.thinking += thinking;
     this.stream.push({
       type: "thinking_delta",
-      contentIndex: this.thinkingBlockIndex,
+      contentIndex: thinkingBlockIndex,
       delta: thinking,
       partial: this.output,
     });
