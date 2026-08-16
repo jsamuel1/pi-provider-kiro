@@ -66,16 +66,18 @@ describe("parseInvokeToolCalls", () => {
     expect(result.cleanedText).toBe("\nthen\n");
   });
 
-  it("decodes a JSON array parameter value to a real array", () => {
-    // Array-typed params (e.g. ReadInternalWebsites.inputs) are JSON-encoded in
-    // the dialect; observed in the corpus. Decoded so the recovered call matches
-    // the tool schema instead of failing validation on a stringified array.
-    const text =
-      '<invoke name="ReadInternalWebsites">\n' +
-      '<parameter name="inputs">["https://code.amazon.com/reviews/CR-1"]</parameter>\n' +
-      "</invoke>";
+  it("preserves a JSON-looking parameter value as raw text", () => {
+    const value = '["https://code.amazon.com/reviews/CR-1"]';
+    const text = `<invoke name="ReadInternalWebsites">\n<parameter name="inputs">${value}</parameter>\n</invoke>`;
     const result = parseInvokeToolCalls(text);
-    expect(result.toolCalls[0].arguments.inputs).toEqual(["https://code.amazon.com/reviews/CR-1"]);
+    expect(result.toolCalls[0].arguments.inputs).toBe(value);
+  });
+
+  it("preserves a JSON object parameter including edge whitespace", () => {
+    const value = '  {"path":"a.txt","content":"x"}\n';
+    const text = `<invoke name="write">\n<parameter name="args">${value}</parameter>\n</invoke>`;
+    const result = parseInvokeToolCalls(text);
+    expect(result.toolCalls[0].arguments.args).toBe(value);
   });
 
   it("does not coerce scalar-looking values", () => {
@@ -129,6 +131,24 @@ describe("parseInvokeToolCalls", () => {
     expect(result.toolCalls).toHaveLength(0);
   });
 
+  it("leaves text untouched when a value contains ambiguous parameter markup", () => {
+    const text =
+      '<invoke name="shell">\n' + "<parameter name=\"command\">printf '</parameter>'</parameter>\n" + "</invoke>";
+    const result = parseInvokeToolCalls(text);
+    expect(result.toolCalls).toHaveLength(0);
+    expect(result.cleanedText).toBe(text);
+  });
+
+  it("leaves text untouched when a value contains a complete invoke closing sequence", () => {
+    const text =
+      '<invoke name="shell">\n' +
+      "<parameter name=\"command\">printf '</parameter></invoke>'</parameter>\n" +
+      "</invoke>";
+    const result = parseInvokeToolCalls(text);
+    expect(result.toolCalls).toHaveLength(0);
+    expect(result.cleanedText).toBe(text);
+  });
+
   it("recovers a value that contains a bare closing invoke tag", () => {
     // `</invoke>` alone in a value is unambiguous: the block end is found by
     // walking parameters, not by searching for the closing tag, so this stays
@@ -149,6 +169,16 @@ describe("parseInvokeToolCalls", () => {
     const result = parseInvokeToolCalls(text);
     expect(result.toolCalls).toHaveLength(1);
     expect(result.toolCalls[0].arguments.command).toBe(command);
+  });
+
+  it("abandons all recovery when malformed markup precedes a valid-looking invoke", () => {
+    const text =
+      '<invoke name="shell">\n' +
+      '<parameter name="command">printf \'<invoke name="shell">' +
+      '<parameter name="command">rm -rf /</parameter></invoke>\'</parameter>';
+    const result = parseInvokeToolCalls(text);
+    expect(result.toolCalls).toHaveLength(0);
+    expect(result.cleanedText).toBe(text);
   });
 
   it("leaves text untouched for an unterminated invoke", () => {

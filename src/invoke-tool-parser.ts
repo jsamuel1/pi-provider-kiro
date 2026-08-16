@@ -80,13 +80,17 @@ function parseBlockAt(text: string, start: number): ParsedBlock | null {
   while (true) {
     const remainder = text.substring(cursor);
     const leadingWhitespace = remainder.length - remainder.trimStart().length;
-    if (leadingWhitespace > 0) {
-      cursor += leadingWhitespace;
-      continue;
-    }
+    if (leadingWhitespace > 0) cursor += leadingWhitespace;
+
     if (text.startsWith(INVOKE_CLOSE, cursor)) {
-      return { name: openMatch[1], arguments: args, end: cursor + INVOKE_CLOSE.length };
+      const end = cursor + INVOKE_CLOSE.length;
+      // A consumed block must end cleanly. This rejects a literal
+      // `</parameter></invoke>` inside a value: accepting that prefix would
+      // execute a silently truncated command and leave quote/tag debris behind.
+      if (end < text.length && !/\s/.test(text[end])) return null;
+      return { name: openMatch[1], arguments: args, end };
     }
+
     const paramMatch = PARAM_OPEN_ANCHORED.exec(text.substring(cursor));
     if (!paramMatch) return null;
     const valueStart = cursor + paramMatch[0].length;
@@ -94,33 +98,13 @@ function parseBlockAt(text: string, start: number): ParsedBlock | null {
     if (valueEnd < 0) return null;
     const value = text.substring(valueStart, valueEnd);
     // A parameter value that itself contains an `<invoke>` open tag makes the
-    // block unattributable: the value's real extent may have been cut short by
-    // a `</parameter>` belonging to the nested markup, and the nested tag would
-    // otherwise be harvested as an independent call. Neither outcome is
-    // acceptable — one corrupts an argument, the other invents a call out of
-    // data — so the whole text is abandoned rather than guessed at.
+    // block unattributable: nested markup could otherwise be harvested as a
+    // call the model never made.
     if (INVOKE_OPEN_ANYWHERE.test(value)) throw new AmbiguousDialectError();
-    args[paramMatch[1]] = coerceValue(value);
+    // Values in this dialect are raw text, not JSON. Preserve every byte:
+    // parsing or trimming can silently change a command that will be executed.
+    args[paramMatch[1]] = value;
     cursor = valueEnd + PARAM_CLOSE.length;
-  }
-}
-
-/**
- * Parameter values are raw text — multi-line, and freely containing quotes,
- * newlines, `>` and braces — so they are preserved byte-for-byte. The single
- * exception is a value whose first non-whitespace character is `[` or `{` and
- * which parses as JSON: those are structured arguments (array/object-typed
- * parameters) that the dialect encodes as JSON, and are decoded so the
- * recovered call matches the tool's schema. Scalars are never coerced, so a
- * literal `true` or `42` stays the string the model wrote.
- */
-function coerceValue(raw: string): unknown {
-  const trimmed = raw.trim();
-  if (!trimmed.startsWith("[") && !trimmed.startsWith("{")) return raw;
-  try {
-    return JSON.parse(trimmed) as unknown;
-  } catch {
-    return raw;
   }
 }
 
@@ -140,6 +124,12 @@ export function parseInvokeToolCalls(text: string): InvokeParseResult {
   while (cursor < text.length) {
     const openStart = text.indexOf(INVOKE_OPEN_SEARCH, cursor);
     if (openStart < 0) break;
+    const containingFence = fences.find((range) => openStart >= range.start && openStart < range.end);
+    if (containingFence) {
+      cursor = containingFence.end;
+      continue;
+    }
+
     let block: ParsedBlock | null;
     try {
       block = parseBlockAt(text, openStart);
@@ -147,15 +137,20 @@ export function parseInvokeToolCalls(text: string): InvokeParseResult {
       if (e instanceof AmbiguousDialectError) return untouched;
       throw e;
     }
-    if (block === null) {
-      cursor = openStart + INVOKE_OPEN_SEARCH.length;
-      continue;
-    }
-    const insideFence = fences.some((r) => openStart >= r.start && openStart < r.end);
-    if (!insideFence) {
-      toolCalls.push({ toolUseId: crypto.randomUUID(), name: block.name, arguments: block.arguments });
-      removals.push({ start: openStart, end: block.end });
-    }
+    // A malformed opener can enclose later valid-looking markup as argument
+    // data. Without a structural end, independence cannot be proven; abandon
+    // all recovery rather than execute an embedded call.
+    if (block === null) return untouched;
+
+    // If apparent block end truncated a raw value containing closing-tag text,
+    // real outer closers remain later in prose. Never execute that prefix.
+    const nextOpen = text.indexOf(INVOKE_OPEN_SEARCH, block.end);
+    const interstitialEnd = nextOpen < 0 ? text.length : nextOpen;
+    const interstitial = text.substring(block.end, interstitialEnd);
+    if (interstitial.includes(PARAM_CLOSE) || interstitial.includes(INVOKE_CLOSE)) return untouched;
+
+    toolCalls.push({ toolUseId: crypto.randomUUID(), name: block.name, arguments: block.arguments });
+    removals.push({ start: openStart, end: block.end });
     // Resume past the whole block: its parameter values are data, not markup.
     // With the nesting bail above this is belt-and-braces — any value holding a
     // full open tag has already abandoned the parse — so no test can currently
