@@ -36,6 +36,7 @@ import {
   HISTORY_LIMIT_CONTEXT_WINDOW,
   prepareHistory,
 } from "./history.js";
+import { isKiroToolStructureRule, kiroConversationEntries, repairKiroConversation } from "./history-validator.js";
 import { getKiroCliCredentials, getKiroCliCredentialsAllowExpired, refreshViaKiroCli } from "./kiro-cli.js";
 import {
   invalidateKiroProfileArn,
@@ -69,6 +70,7 @@ import {
   type KiroToolSpec,
   type KiroUserInputMessage,
   normalizeMessages,
+  relocateDisplacedToolResults,
   sanitizeSurrogates,
   TOOL_RESULT_LIMIT,
   truncate,
@@ -259,7 +261,7 @@ export function streamKiro(
       }
 
       const kiroModelId = resolveKiroModel(model.id, modelMetadata.kiroModelId);
-      const effortConfig = getKiroEffortConfig(modelMetadata, kiroModelId);
+      const effortConfig = getKiroEffortConfig(modelMetadata.additionalModelRequestFieldsSchema, kiroModelId);
       const additionalModelRequestFields = buildKiroAdditionalModelRequestFields(
         modelMetadata,
         kiroModelId,
@@ -301,7 +303,13 @@ export function streamKiro(
       while (retryCount <= maxRetries) {
         if (options?.signal?.aborted) throw options.signal.reason;
         const effectiveSystemPrompt = systemPrompt;
-        const normalized = normalizeMessages(context.messages);
+        // Relocate a tool result that arrived behind a later assistant turn than
+        // the one that called it, before anything positional runs. Interleaved
+        // concurrent tool executions produce that shape, and `sanitizeHistory`
+        // pairs POSITIONALLY, so without this pass the displaced result's issuing
+        // assistant is dropped and the real tool output is discarded. Pure
+        // reorder — see `relocateDisplacedToolResults`.
+        const normalized = relocateDisplacedToolResults(normalizeMessages(context.messages));
         const {
           history: rawHistory,
           systemPrepended,
@@ -323,8 +331,17 @@ export function streamKiro(
           if (Array.isArray(am.content))
             for (const b of am.content) {
               if (b.type === "text") armContent += (b as TextContent).text;
-              else if (b.type === "thinking")
-                armContent = `<thinking>${(b as unknown as { thinking: string }).thinking}</thinking>\n\n${armContent}`;
+              // Reasoning is deliberately NOT serialized into the assistant text
+              // channel, matching `buildHistory` and first-party
+              // `extractTextContent`, which type-filters to `text`. Flattening it
+              // to `<thinking>...</thinking>` writes literal markup into the
+              // string the model reads back as its own prior speech.
+              //
+              // Unlike the history site, this needs no "turn had blocks" guard:
+              // `currentMsgStartIdx` increments past an assistant that declares no
+              // `toolCall`, so reaching this branch at all means one exists and
+              // `armToolUses` is non-empty. The guard below therefore cannot drop
+              // the entry when reasoning is excluded.
               else if (b.type === "toolCall") {
                 const tc = b as ToolCall;
                 armToolUses.push({
@@ -341,8 +358,13 @@ export function streamKiro(
             const lastEntryForArm = history[history.length - 1];
             const prevArm = lastEntryForArm?.assistantResponseMessage;
             if (history.length > 0 && !lastEntryForArm?.userInputMessage && prevArm) {
-              // Merge into previous assistant message to maintain alternation without synthetic padding
-              prevArm.content += `\n\n${armContent}`;
+              // Merge into previous assistant message to maintain alternation
+              // without synthetic padding. Join only non-empty sides: a turn that
+              // carried only reasoning or only a tool call leaves `armContent`
+              // empty, and an unconditional separator would append a bare `\n\n`
+              // onto text the model actually produced.
+              prevArm.content =
+                prevArm.content && armContent ? `${prevArm.content}\n\n${armContent}` : prevArm.content || armContent;
               if (armToolUses.length > 0) prevArm.toolUses = [...(prevArm.toolUses || []), ...armToolUses];
             } else {
               history.push({
@@ -371,7 +393,10 @@ export function streamKiro(
             const converted = convertImagesToKiro(toolResultImages);
             currentImages = currentImages ? [...currentImages, ...converted] : converted;
           }
-          currentContent = currentToolResults.length > 0 ? "Tool results provided." : "Please proceed with the task.";
+          // A tool turn carries its payload in `userInputMessageContext.toolResults`,
+          // so it needs no text. Leaving this empty also leaves the fallback
+          // below free to fill in only genuinely payload-less turns.
+          currentContent = "";
         } else if (firstMsg?.role === "toolResult") {
           const toolResultImages2: ImageContent[] = [];
           for (const m of currentMessages)
@@ -389,7 +414,8 @@ export function streamKiro(
             const converted = convertImagesToKiro(toolResultImages2);
             currentImages = currentImages ? [...currentImages, ...converted] : converted;
           }
-          currentContent = "Tool results provided.";
+          // Empty by design — `toolResults` is this turn's payload.
+          currentContent = "";
         } else if (firstMsg?.role === "user") {
           currentContent = typeof firstMsg.content === "string" ? firstMsg.content : getContentText(firstMsg);
           if (effectiveSystemPrompt && !systemPrepended)
@@ -400,7 +426,7 @@ export function streamKiro(
         assertHistoryWithinLimit(history, dynamicHistoryLimit);
         // Prepend truncation notice if the previous assistant response was cut off
         if (wasPreviousResponseTruncated(context.messages)) {
-          currentContent = `${TRUNCATION_NOTICE}\n\n${currentContent}`;
+          currentContent = currentContent === "" ? TRUNCATION_NOTICE : `${TRUNCATION_NOTICE}\n\n${currentContent}`;
         }
         // Always synthesize placeholder specs for tool names referenced in
         // history, even when context.tools is empty/undefined. Without this,
@@ -419,12 +445,98 @@ export function streamKiro(
           const imgs = extractImages(firstMsg);
           if (imgs.length > 0) currentImages = convertImagesToKiro(imgs as ImageContent[]);
         }
-        // `content` is required: Kiro answers an empty one with a 400
-        // "Improperly formed request." Fall back to a neutral prompt so a turn
-        // that carries only images (or an empty-text user message) still sends.
-        if (currentContent === "") currentContent = EMPTY_CONTENT_PLACEHOLDER;
+        // A turn with neither text nor tool results has no payload at all:
+        // an image-only user message, an empty-text user message, or a
+        // host-appended message whose role falls outside pi-ai's `Message`
+        // union. Send a neutral prompt so its attachments still reach the
+        // model (#106).
+        //
+        // The `currentToolResults` guard is load-bearing. Without it this line
+        // refills every tool turn that deliberately left `currentContent`
+        // empty, and the only change is which sentence is fabricated. Kiro's
+        // rule is content **or** tool results — see EMPTY_CONTENT_PLACEHOLDER.
+        if (currentContent === "" && currentToolResults.length === 0) currentContent = EMPTY_CONTENT_PLACEHOLDER;
         // kiro-cli does not enforce alternation — the API accepts
         // non-alternating history. No synthetic padding needed.
+        //
+        // Pre-send REPAIR against the seven rules first-party Kiro Agent
+        // enforces. `prepareHistory` covers the shapes this provider itself
+        // produces, but not every shape a caller can hand us: `sanitizeHistory`
+        // tests tool pairing by POSITION, so an assistant entry with `toolUses`
+        // survives whenever the next entry carries any `toolResults` at all,
+        // matching ids or not, and `injectSyntheticToolCalls` only rescues
+        // orphaned RESULTS. A mismatched pair — both partners present, paired
+        // with each other's counterpart — passes both passes untouched and is
+        // rejected on the wire with `400 TOOL_USE_RESULT_MISMATCH`.
+        //
+        // Observed 2026-08-14: a caller whose transcript interleaved two
+        // concurrent tool executions sent exactly that shape, and because the
+        // retry resends identical history the session was terminally wedged.
+        //
+        // Repair runs on the WHOLE conversation and is split back afterwards.
+        // Repairing `history` alone would be wrong in the ordinary case: its
+        // last entry is normally the assistant whose `toolUses` this very
+        // request answers, so rule 4 would synthesize a FAILED result for a call
+        // whose real output is sitting in the current message.
+        //
+        // Still never throws. `remaining` is what repair could not express, and
+        // that — not merely "input was invalid" — is what earns the warning.
+        const conversationEntries = kiroConversationEntries(history, {
+          content: currentContent,
+          modelId: kiroModelId,
+          origin: "KIRO_CLI",
+          ...(uimc ? { userInputMessageContext: uimc } : {}),
+        });
+        const repair = repairKiroConversation(conversationEntries);
+        if (repair.diagnostics.length > 0) {
+          debugLog("request.invariants", { errors: repair.diagnostics, remaining: repair.remaining });
+        }
+        // Split back. Repair moves entries in only three ways, and each one keeps
+        // the current message last:
+        //   - step 1 drops a prefix, never a suffix;
+        //   - step 4 inserts a synthetic user turn only AFTER an assistant whose
+        //     uses nothing answers, and the current message is a user entry, so
+        //     no assistant is ever last;
+        //   - steps 2/3/5 rewrite entries in place.
+        // The one exception is total collapse: a conversation that is *only* a
+        // bare tool-result carrier has no valid opening entry, so step 1 consumes
+        // it and returns nothing. Because step 1 cannot skip past a survivor,
+        // `entries.length === 0` is the only shape where the current message is
+        // gone — anything longer keeps it at the end.
+        const repairedCurrent = repair.entries[repair.entries.length - 1]?.userInputMessage;
+        // `currentImages` is carried separately below and is not part of the
+        // repaired projection, so only text + context are read back here.
+        //
+        // Read the repaired context EXACTLY, including when repair removed it.
+        // A `?? uimc` fallback here would undo the repair in the one case that
+        // matters most: stripping every orphaned tool result leaves a turn with
+        // no context at all, and falling back would put the orphans — the shape
+        // the backend rejects — straight back onto the wire.
+        let wireHistory: KiroHistoryEntry[];
+        let wireContent: string;
+        let wireUimc: typeof uimc;
+        if (repairedCurrent) {
+          wireHistory = repair.entries.slice(0, -1);
+          wireContent = repairedCurrent.content;
+          wireUimc = repairedCurrent.userInputMessageContext;
+        } else {
+          // Collapsed. Apply what repair would have applied to a lone carrier:
+          // drop the results that answer nothing (steps 3), keep any tool
+          // catalog, and give the empty turn the neutral prompt (step 5).
+          wireHistory = [];
+          wireContent = currentContent || EMPTY_CONTENT_PLACEHOLDER;
+          wireUimc = uimc?.tools?.length ? { tools: uimc.tools } : undefined;
+        }
+        if (repair.remaining.length > 0) {
+          const structural = repair.remaining.filter((e) => isKiroToolStructureRule(e.rule));
+          if (structural.length > 0) {
+            console.warn(
+              `[pi-provider-kiro] outbound history still violates ${structural
+                .map((e) => `${e.rule}@${e.index}`)
+                .join(", ")} after repair — Kiro may reject this request`,
+            );
+          }
+        }
         const request: KiroRequest = {
           conversationState: {
             chatTriggerType: "MANUAL",
@@ -432,14 +544,14 @@ export function streamKiro(
             conversationId,
             currentMessage: {
               userInputMessage: {
-                content: sanitizeSurrogates(currentContent),
+                content: sanitizeSurrogates(wireContent),
                 modelId: kiroModelId,
                 origin: "KIRO_CLI",
                 ...(currentImages ? { images: currentImages } : {}),
-                ...(uimc ? { userInputMessageContext: uimc } : {}),
+                ...(wireUimc ? { userInputMessageContext: wireUimc } : {}),
               },
             },
-            ...(history.length > 0 ? { history } : {}),
+            ...(wireHistory.length > 0 ? { history: wireHistory } : {}),
           },
           ...(additionalModelRequestFields ? { additionalModelRequestFields } : {}),
           profileArn,
@@ -455,10 +567,14 @@ export function streamKiro(
           debugLog("request.send", {
             attempt: retryCount,
             capacityAttempt: capacityRetryCount,
-            historyLen: history.length,
-            currentContentLen: currentContent.length,
+            // Wire values, not pre-repair ones: this line is what a reader
+            // correlates against a 400, so it must describe the bytes actually
+            // sent. `toolResultCount` likewise counts the repaired carrier,
+            // which may include synthesized results the raw turn never had.
+            historyLen: wireHistory.length,
+            currentContentLen: wireContent.length,
             hasImages: !!currentImages,
-            toolResultCount: currentToolResults.length,
+            toolResultCount: wireUimc?.toolResults?.length ?? 0,
             request,
           });
           response = await fetch(endpoint, {

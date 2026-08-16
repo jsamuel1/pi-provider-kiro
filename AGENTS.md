@@ -19,7 +19,9 @@ pi-provider-kiro/
 │   ├── history.ts          # F6: History truncation + sanitization
 │   ├── thinking-parser.ts  # F7: Streaming <thinking> tag parser
 │   ├── event-parser.ts     # F8: Kiro stream JSON event parser
-│   └── stream.ts           # F9: Main streaming orchestrator
+│   ├── stream.ts           # F9: Main streaming orchestrator
+│   ├── login.ts            # F10: Interactive login (Builder ID / IdC / social)
+│   └── history-validator.ts # F11: Conversation invariant validation + repair
 ├── test/                   # 1:1 test files for each source file
 ├── dist/                   # Compiled output (tsc)
 ├── .agents/summary/        # Detailed documentation (architecture, components, etc.)
@@ -31,13 +33,21 @@ pi-provider-kiro/
 ## Key Patterns
 
 ### Feature-per-file
-Each `src/` file owns exactly one numbered feature (F1–F9). When modifying a feature, the relevant file is obvious. Each has a matching test file.
+Each `src/` file owns exactly one numbered feature (F1–F11). When modifying a feature, the relevant file is obvious. Each has a matching test file. The numbered set is not the whole tree — `src/` also holds unnumbered support modules (`endpoints.ts`, `retry.ts`, `debug.ts`, and others).
 
 ### Model ID Convention
 pi uses dashes (`claude-sonnet-4-6`), Kiro API uses dots (`claude-sonnet-4.6`). Conversion in `resolveKiroModel()` via regex: `(\d)-(\d)` → `$1.$2`. The `KIRO_MODEL_IDS` Set is the source of truth for valid model IDs.
 
 ### Kiro History Format
 Kiro requires strict alternating `userInputMessage` / `assistantResponseMessage` entries. Tool results must be wrapped in synthetic user messages. `buildHistory()` in transform.ts handles this; `history.ts` sanitizes and truncates.
+
+A tool-result turn carries its payload in `userInputMessageContext.toolResults` and ships `content: ""`. Kiro's rule is content **or** tool results (`NON_EMPTY_USER_MESSAGE` in first-party Kiro Agent), so no carrier text is needed — and inventing some puts a sentence the user never wrote into the conversation as a user utterance. `EMPTY_CONTENT_PLACEHOLDER` is only for a turn with neither: image-only, empty-text, or an out-of-union role.
+
+`history-validator.ts` (F11) owns the seven invariants. `streamKiro` calls `repairKiroConversation` on the whole conversation (history plus the current message) immediately before building the request and sends the repaired entries. It never throws; a violation that survives repair is warned about, not fatal. `prepareHistory` still runs first and still owns image stripping, truncation, and its own salvage passes — but its pairing test is positional, so a mismatched tool-use/tool-result pair reaches repair as the shape that actually needs fixing.
+
+A tool result that arrived behind a later assistant turn than the one that called it is relocated back behind its issuing turn, matched by id, before anything positional runs (`relocateDisplacedToolResults`). That preserves the real tool output which positional sanitization would otherwise discard, and for the interleaved-transcript shape it also makes `ALTERNATING_MESSAGES` hold — the interjection merges into the relocated carrier instead of forming a second consecutive user entry. The cost is wire chronology: a user turn that interrupted between a call and its result now appears after that result. Pinned by tests in `test/stream.test.ts` and `test/transform.test.ts`; see the CHANGELOG entry.
+
+Historical assistant reasoning is **not** serialized into `assistantResponseMessage.content`. First-party Kiro Agent's `extractTextContent` type-filters to `text`, and flattening reasoning to `<thinking>…</thinking>` fabricated an XML dialect into the model's own remembered speech. A reasoning-only assistant turn is retained with `content: ""` so alternation survives.
 
 ### Streaming Pipeline
 Raw bytes → `parseKiroEvents()` → typed `KiroStreamEvent` → `ThinkingTagParser` (if reasoning) → pi `AssistantMessageEventStream` events.

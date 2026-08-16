@@ -11,6 +11,7 @@ import type {
 import { isContextOverflow } from "@earendil-works/pi-ai/compat";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { findJsonEnd } from "../src/bracket-tool-parser.js";
+import { validateKiroConversation, validateKiroToolStructure } from "../src/history-validator.js";
 import { capacityRetryConfig, retryConfig } from "../src/retry.js";
 import { resetProfileArnCache, streamKiro } from "../src/stream.js";
 import { EMPTY_CONTENT_PLACEHOLDER, type KiroHistoryEntry } from "../src/transform.js";
@@ -1278,10 +1279,13 @@ describe("Feature 9: Streaming Integration", () => {
     expect(done).toBeDefined();
     expect(done?.type === "done" && done.message.stopReason).toBe("stop");
 
-    // Verify tool results were sent in the request body
+    // Verify tool results were sent in the request body. `content` is empty by
+    // design: Kiro's rule is content **or** toolResults, and this turn's payload
+    // is the toolResults. Filling it with prose would put a sentence the user
+    // never wrote into the conversation as a user utterance.
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     const currentMsg = body.conversationState.currentMessage.userInputMessage;
-    expect(currentMsg.content).toBe("Tool results provided.");
+    expect(currentMsg.content).toBe("");
     expect(currentMsg.userInputMessageContext?.toolResults).toHaveLength(1);
     expect(currentMsg.userInputMessageContext.toolResults[0].toolUseId).toBe("tc1");
 
@@ -1344,12 +1348,18 @@ describe("Feature 9: Streaming Integration", () => {
   });
 
   // =========================================================================
-  // Required `content` field
-  // —————————————————————————————————————————————————————————————————————————
-  // Kiro rejects a current message with an empty `content` as
-  // "Improperly formed request." (reason REQUEST_BODY_INVALID). A turn can
-  // reach the request builder with no text — an image-only user message, or a
-  // user message whose text is empty — so a placeholder must be substituted.
+  // `content` on a payload-less turn vs. a tool turn
+  // ————————————————————————————————————————————————————————————————————
+  // Kiro's rule is content **or** tool results. A turn carrying neither has no
+  // payload at all — an image-only user message, an empty-text user message, or
+  // a host-appended message whose role falls outside pi-ai's `Message` union —
+  // and gets the neutral placeholder so its attachments still reach the model
+  // (#106).
+  //
+  // A tool turn is not that turn: its payload is
+  // `userInputMessageContext.toolResults`, so its `content` stays empty. Both
+  // cases share one line in the request builder, and the guard between them is
+  // load-bearing — see the mutation probe below.
   // =========================================================================
 
   // These use a prior turn so the system prompt is already consumed by the
@@ -1416,6 +1426,605 @@ describe("Feature 9: Streaming Integration", () => {
     const currentMsg = JSON.parse(mockFetch.mock.calls[0][1].body).conversationState.currentMessage.userInputMessage;
     expect(currentMsg.content).toContain("Explain this repo");
 
+    vi.unstubAllGlobals();
+  });
+
+  // -----------------------------------------------------------------------
+  // The tool-turn side of the same line.
+  //
+  // MUTATION PROBE for the `currentToolResults.length === 0` guard on the
+  // placeholder fallback in stream.ts: widen that condition back to a bare
+  // `if (currentContent === "")` and these three go red with
+  // `EMPTY_CONTENT_PLACEHOLDER` in place of `""`. Without them the whole change
+  // passes while every tool turn is refilled with a different fabricated
+  // sentence — a no-op with new wording.
+  // -----------------------------------------------------------------------
+
+  it("sends empty content on a tool-result turn, with the results as payload", async () => {
+    const assistantWithTool: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tc1", name: "calc", arguments: { a: 2 } }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        ...settledTurn(),
+        assistantWithTool,
+        {
+          role: "toolResult",
+          toolCallId: "tc1",
+          toolName: "calc",
+          content: [{ type: "text", text: "4" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "calc", description: "Calculate", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"4."}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const currentMsg = JSON.parse(mockFetch.mock.calls[0][1].body).conversationState.currentMessage.userInputMessage;
+    expect(currentMsg.content).toBe("");
+    expect(currentMsg.userInputMessageContext.toolResults).toHaveLength(1);
+    expect(currentMsg.userInputMessageContext.toolResults[0].toolUseId).toBe("tc1");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("sends empty content when the turn is tool results alone", async () => {
+    const assistantWithTool: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tc9", name: "calc", arguments: {} }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        ...settledTurn(),
+        assistantWithTool,
+        {
+          role: "toolResult",
+          toolCallId: "tc9",
+          toolName: "calc",
+          content: [{ type: "text", text: "9" }],
+          isError: false,
+          timestamp: ts,
+        },
+        {
+          role: "toolResult",
+          toolCallId: "tc9",
+          toolName: "calc",
+          content: [{ type: "text", text: "9 again" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "calc", description: "Calculate", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"9."}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const currentMsg = JSON.parse(mockFetch.mock.calls[0][1].body).conversationState.currentMessage.userInputMessage;
+    expect(currentMsg.content).toBe("");
+    expect(currentMsg.userInputMessageContext.toolResults.length).toBeGreaterThan(0);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("never puts carrier prose anywhere in a tool-turn request", async () => {
+    const assistantWithTool: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tc1", name: "calc", arguments: {} }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const secondAssistant: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tc2", name: "calc", arguments: {} }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const tr = (id: string, text: string): Context["messages"][number] => ({
+      role: "toolResult",
+      toolCallId: id,
+      toolName: "calc",
+      content: [{ type: "text", text }],
+      isError: false,
+      timestamp: ts,
+    });
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: "do the thing", timestamp: ts },
+        assistantWithTool,
+        tr("tc1", "one"),
+        secondAssistant,
+        tr("tc2", "two"),
+      ],
+      tools: [{ name: "calc", description: "Calculate", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"done"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const body = mockFetch.mock.calls[0][1].body as string;
+    expect(body).not.toContain("Tool results provided");
+    // The one real user utterance survives verbatim.
+    const parsed = JSON.parse(body);
+    expect(parsed.conversationState.history[0].userInputMessage.content).toContain("do the thing");
+
+    vi.unstubAllGlobals();
+  });
+
+  // -----------------------------------------------------------------------
+  // The pre-send REPAIR, exercised through `streamKiro` rather than through
+  // `repairKiroConversation` directly. Unit tests on the validator prove the
+  // rules; only these prove the request builder actually runs them and sends
+  // the repaired bytes.
+  //
+  // MUTATION PROBE: delete the `kiroConversationEntries`/
+  // `repairKiroConversation` block in stream.ts and these go red. Nothing else
+  // in the suite does — `tsc` still passes and biome reports the orphaned
+  // imports as a warning with exit 0.
+  //
+  // Reachability: `sanitizeHistory` repairs orphaned results inside `history`
+  // by synthesizing an `unknown_tool` toolUse, but it tests pairing by POSITION,
+  // so a mismatched PAIR — both partners present, each paired with the other's
+  // counterpart — passes it untouched, and the current message is assembled
+  // after that pass and is not covered by it at all. Both shapes reach the wire
+  // as `400 TOOL_USE_RESULT_MISMATCH` unless repaired here.
+  // -----------------------------------------------------------------------
+
+  // -----------------------------------------------------------------------
+  // The live wedge, 2026-08-14. Two concurrent tool executions interleaved into
+  // one transcript, so a tool result landed paired with the WRONG assistant's
+  // tool use:
+  //
+  //   assistant(toolUses=[A]) / user(text) / assistant(toolUses=[B]) / user(results=[A])
+  //
+  // Kiro answered `400 ... tool_use ids were found without tool_result blocks
+  // immediately after: <B>` and, because the retry resends identical history,
+  // the session was terminally wedged — every subsequent turn 400d.
+  //
+  // `prepareHistory` cannot see it: `sanitizeHistory` tests pairing by POSITION,
+  // and `injectSyntheticToolCalls` only rescues orphaned RESULTS.
+  // -----------------------------------------------------------------------
+  // The branch where repair legitimately removes `userInputMessageContext`
+  // entirely: the carrier's results answer nothing, and the turn declares no
+  // tools, so after stripping there is nothing left to put in the context. This
+  // is the shape a `?? uimc` fallback silently undoes.
+  //
+  // No tools are declared and history contains no `toolUses`, so
+  // `addPlaceholderTools` synthesizes none either — that is what makes the
+  // repaired context empty rather than tools-only.
+  //
+  // MUTATION PROBE: change `wireUimc = repairedCurrent.userInputMessageContext`
+  // to `... ?? uimc` in stream.ts and this goes red — the stripped orphan is put
+  // straight back onto the wire.
+  it("sends no tool context at all when repair strips the only results", async () => {
+    const settledAssistant: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "Done." }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "stop",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: "do it", timestamp: ts },
+        settledAssistant,
+        // Answers `tcZ`, which no assistant turn ever issued.
+        {
+          role: "toolResult",
+          toolCallId: "tcZ",
+          toolName: "calc",
+          content: [{ type: "text", text: "orphan" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const current = sent.conversationState.currentMessage.userInputMessage;
+    expect(current.userInputMessageContext).toBeUndefined();
+    // With no payload left, step 5 gives the turn the neutral prompt.
+    expect(current.content).toBe(EMPTY_CONTENT_PLACEHOLDER);
+    const conversation = [...(sent.conversationState.history ?? []), { userInputMessage: current }];
+    expect(validateKiroConversation(conversation).valid).toBe(true);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("does not flatten reasoning into the current turn's assistant content", async () => {
+    // The history site (`buildHistory`) stopped flattening earlier; this is the
+    // OTHER site, in the current-message assistant branch. It reaches the wire
+    // through the same `assistantResponseMessage.content`, so leaving it flattened
+    // made the parity claim only half true.
+    const withThinking: AssistantMessage = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "deciding which file to read" } as unknown as TextContent,
+        { type: "text", text: "reading it now" },
+        { type: "toolCall", id: "tc9", name: "read", arguments: { path: "/tmp/tc9" } },
+      ],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    } as AssistantMessage;
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [...settledTurn(), withThinking, makeToolResult("tc9")],
+      tools: [{ name: "read", description: "Read", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const entry = (sent.conversationState.history ?? []).find((h: KiroHistoryEntry) =>
+      h.assistantResponseMessage?.toolUses?.some((tu) => tu.toolUseId === "tc9"),
+    );
+    expect(entry).toBeDefined();
+    // The reasoning is gone from the text channel, the real text survives, and the
+    // structured tool use is untouched.
+    expect(entry?.assistantResponseMessage?.content).not.toContain("<thinking>");
+    expect(entry?.assistantResponseMessage?.content).not.toContain("deciding which file to read");
+    expect(entry?.assistantResponseMessage?.content).toContain("reading it now");
+    expect(entry?.assistantResponseMessage?.toolUses?.[0]?.name).toBe("read");
+    // Nothing anywhere in the request carries the markup.
+    expect(JSON.stringify(sent)).not.toContain("<thinking>");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("does not append a bare separator when merging an empty current turn into a previous assistant", async () => {
+    // A current turn carrying only a toolCall leaves `armContent === ""`. Merging
+    // that into the preceding assistant with an unconditional `\n\n` appends a
+    // dangling separator onto text the model actually produced.
+    //
+    // Reaching the merge branch needs the LAST history entry to be an assistant
+    // with no `userInputMessage`, so the fixture puts two assistant turns back to
+    // back with no tool result between them. A tool-result carrier in between ends
+    // history on a user entry and takes the push branch instead, which is what an
+    // earlier version of this test did — it passed against the unconditional
+    // separator and proved nothing.
+    const plainAssistant: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "earlier answer" }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "stop",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: "go", timestamp: ts },
+        plainAssistant,
+        makeToolCall("tcB"),
+        makeToolResult("tcB"),
+      ],
+      tools: [{ name: "read", description: "Read", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const merged = (sent.conversationState.history ?? []).find((h: KiroHistoryEntry) =>
+      h.assistantResponseMessage?.toolUses?.some((tu) => tu.toolUseId === "tcB"),
+    );
+    // The merge happened onto the real text, and it is byte-identical.
+    expect(merged?.assistantResponseMessage?.content).toBe("earlier answer");
+    for (const entry of sent.conversationState.history ?? []) {
+      const content = entry.assistantResponseMessage?.content;
+      if (typeof content !== "string") continue;
+      expect(content).not.toMatch(/\n\n$/);
+    }
+
+    vi.unstubAllGlobals();
+  });
+
+  it("repairs the live mismatched-pair wedge so it no longer earns a 400", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: "build it", timestamp: ts },
+        makeToolCall("A"),
+        { role: "user", content: "continue", timestamp: ts },
+        makeToolCall("B"),
+        {
+          role: "toolResult",
+          toolCallId: "A",
+          toolName: "read",
+          content: [{ type: "text", text: "REAL_OUTPUT_A" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "read", description: "Read", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const current = sent.conversationState.currentMessage.userInputMessage;
+    const conversation = [...(sent.conversationState.history ?? []), { userInputMessage: current }];
+
+    // The 400 is gone. `B` — the toolUse the backend named — is answered, and no
+    // result answering nothing is left on the wire. This is the whole point: the
+    // request is now one the backend accepts, so the session is not wedged.
+    expect(validateKiroToolStructure(conversation).valid).toBe(true);
+    expect(current.userInputMessageContext.toolResults).toHaveLength(1);
+    expect(current.userInputMessageContext.toolResults[0].toolUseId).toBe("B");
+    expect(current.userInputMessageContext.toolResults[0].status).toBe("error");
+    // `B` is answered rather than dropped, so the model still sees that its call
+    // was issued and did not complete.
+    const armToolUses = (sent.conversationState.history ?? []).flatMap(
+      (h: KiroHistoryEntry) => h.assistantResponseMessage?.toolUses ?? [],
+    );
+    expect(armToolUses.map((tu: { toolUseId: string }) => tu.toolUseId)).toContain("B");
+
+    // ---- What relocation preserves, and what it still costs. ----
+    //
+    // 1. `A`'s real output SURVIVES. `relocateDisplacedToolResults` moves the
+    //    displaced result back behind the assistant that issued it, before
+    //    anything positional runs, so `sanitizeHistory` no longer drops that
+    //    assistant and the result is no longer orphaned. This is a pure reorder:
+    //    nothing is fabricated and nothing is dropped.
+    expect(JSON.stringify(sent)).toContain("REAL_OUTPUT_A");
+    const historyResults = (sent.conversationState.history ?? []).flatMap(
+      (h: KiroHistoryEntry) => h.userInputMessage?.userInputMessageContext?.toolResults ?? [],
+    );
+    const resultA = historyResults.find((tr: { toolUseId: string }) => tr.toolUseId === "A");
+    expect(resultA).toBeDefined();
+    expect(resultA.status).toBe("success");
+    expect(resultA.content[0].text).toBe("REAL_OUTPUT_A");
+    // Paired with the assistant that actually issued it, which is what makes the
+    // request acceptable rather than merely present in the bytes.
+    const aIdx = (sent.conversationState.history ?? []).findIndex((h: KiroHistoryEntry) =>
+      h.assistantResponseMessage?.toolUses?.some((tu) => tu.toolUseId === "A"),
+    );
+    const afterA = (sent.conversationState.history ?? [])[aIdx + 1];
+    expect(afterA?.userInputMessage?.userInputMessageContext?.toolResults?.[0]?.toolUseId).toBe("A");
+    //
+    // 2. The real user interjection survives VERBATIM. Merging it into the
+    //    now-empty carrier must not prepend a separator: `"continue"`, never
+    //    `"\n\ncontinue"`. Fabricating whitespace onto a message the user wrote is
+    //    the same defect class as the carrier prose this change removes.
+    const interjection = (sent.conversationState.history ?? []).find((h: KiroHistoryEntry) =>
+      h.userInputMessage?.userInputMessageContext?.toolResults?.some((tr) => tr.toolUseId === "A"),
+    );
+    expect(interjection?.userInputMessage?.content).toBe("continue");
+    //
+    // 3. Wire chronology shifts, and that is the accepted cost. The interjection
+    //    was said BEFORE `A`'s result arrived, but appears after it on the wire,
+    //    because relocation moves the result and not the user turn. A fidelity
+    //    loss, not a fabrication, and strictly less lossy than discarding real
+    //    tool output the model is waiting on.
+    expect(aIdx).toBeLessThan(
+      (sent.conversationState.history ?? []).findIndex(
+        (h: KiroHistoryEntry) => h.userInputMessage?.content === "continue",
+      ),
+    );
+    //
+    // 4. `B` is still answered synthetically. Relocation makes `B` the trailing
+    //    turn with nothing after it, so repair supplies its missing result — the
+    //    same synthesis emitted before relocation existed. Relocation changes
+    //    which output is PRESERVED, not how much is fabricated.
+    //
+    // 5. All seven rules now pass for this shape — a better outcome than
+    //    relocation was expected to deliver. Before relocation the interjection
+    //    left two consecutive user entries and `ALTERNATING_MESSAGES` survived as
+    //    an unrepairable residual. Relocation moves `A`'s result to sit directly
+    //    behind `A`, and the interjection then merges INTO that carrier entry
+    //    rather than following it, so one user entry now carries both `A`'s real
+    //    result and the user's verbatim text. Alternation holds as a consequence.
+    //
+    //    This is asserted rather than assumed: it is the reason the residual list
+    //    is empty, and if a future change reintroduces a separate interjection
+    //    entry this goes red rather than silently regressing to a residual.
+    const residual = validateKiroConversation(conversation).errors;
+    expect(residual).toEqual([]);
+    const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(warned).not.toContain("outbound history");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("repairs an outbound tool structure that violates an invariant", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const assistantWithTool: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tcA", name: "calc", arguments: {} }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        ...settledTurn(),
+        assistantWithTool,
+        // Answers `tcZ`, which no preceding toolUse issued.
+        {
+          role: "toolResult",
+          toolCallId: "tcZ",
+          toolName: "calc",
+          content: [{ type: "text", text: "orphan" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "calc", description: "Calculate", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    // Repaired, not merely reported: the orphan `tcZ` result is stripped and
+    // `tcA` — which nothing answered — gets a synthetic failure result, so the
+    // conversation that reaches the wire satisfies all seven rules.
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const conversation = [
+      ...(sent.conversationState.history ?? []),
+      { userInputMessage: sent.conversationState.currentMessage.userInputMessage },
+    ];
+    expect(validateKiroConversation(conversation).valid).toBe(true);
+    const sentResults = sent.conversationState.currentMessage.userInputMessage.userInputMessageContext?.toolResults;
+    expect(sentResults?.map((tr: { toolUseId: string }) => tr.toolUseId)).toEqual(["tcA"]);
+    expect(sentResults?.[0].status).toBe("error");
+    // Nothing survived repair, so nothing is warned about.
+    const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(warned).not.toContain("outbound history");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("stays silent on a well-formed tool turn", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const assistantWithTool: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tcA", name: "calc", arguments: {} }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        ...settledTurn(),
+        assistantWithTool,
+        {
+          role: "toolResult",
+          toolCallId: "tcA",
+          toolName: "calc",
+          content: [{ type: "text", text: "7" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "calc", description: "Calculate", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(warned).not.toContain("outbound history");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  // Probed 2026-08-11 before this test existed: this context reached the wire as
+  // `currentMessage.userInputMessage` with populated `toolResults`, no `history`
+  // at all, and no `toolUse` anywhere — the exact shape the backend rejects as
+  // `TOOL_USE_RESULT_MISMATCH` — while the invariant check stayed silent, because
+  // the pairwise walk only inspects a carrier that follows an assistant entry.
+  //
+  // It is now repaired rather than warned about. This is also the one shape that
+  // repair COLLAPSES: the whole conversation is a single bare carrier, so step 1
+  // finds no valid opening entry and consumes it. `stream.ts` handles that
+  // explicitly — strip the results that answer nothing, keep the tool catalog,
+  // and fall back to the neutral prompt.
+  //
+  // MUTATION PROBE: restore `wireUimc = repairedCurrent?.userInputMessageContext ?? uimc`
+  // and this goes red — the fallback puts the stripped orphan straight back.
+  it("repairs a tool-result carrier that has no toolUse anywhere", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        // No assistant turn ever issued `tcZ`. `sanitizeHistory` cannot repair
+        // this one: the carrier is the current message, not a history entry.
+        {
+          role: "toolResult",
+          toolCallId: "tcZ",
+          toolName: "calc",
+          content: [{ type: "text", text: "orphan" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "calc", description: "Calculate", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(
+      streamKiro(makeModel({ kiroProfileArn: "arn:aws:codewhisperer:us-east-1:0:profile/X" }), context, {
+        apiKey: "tok",
+      }),
+    );
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const currentMsg = sent.conversationState.currentMessage.userInputMessage;
+    // The orphan is gone — sending it is what earns the 400.
+    expect(currentMsg.userInputMessageContext?.toolResults ?? []).toHaveLength(0);
+    // The tool catalog survives, and the turn still has a payload.
+    expect(currentMsg.userInputMessageContext?.tools).toBeDefined();
+    expect(currentMsg.content).toBe(EMPTY_CONTENT_PLACEHOLDER);
+    expect(sent.conversationState.history ?? []).toHaveLength(0);
+    const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(warned).not.toContain("outbound history");
+
+    warnSpy.mockRestore();
     vi.unstubAllGlobals();
   });
 
