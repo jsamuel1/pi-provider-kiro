@@ -91,6 +91,37 @@ import {
 import { TRUNCATION_NOTICE, wasPreviousResponseTruncated } from "./truncation.js";
 import { estimateKiroCreditCost, type KiroUsageTracking } from "./usage-tracking.js";
 
+/** Minimal structural view of a refreshed Kiro credential handed to the host's
+ *  accessor. A superset lives in `oauth.ts` (`KiroCredentials`); this pins only
+ *  what write-back reads so the accessor contract does not couple to that type. */
+export interface KiroCredentialLike {
+  access: string;
+  expires?: number;
+  region?: string;
+  profileArn?: string;
+  authMethod?: string;
+}
+
+/** Optional host-owned credential accessor, passed on stream options. `get`
+ *  seeds each call from the freshest token the host holds; `set` receives a
+ *  credential the provider refreshed mid-call so it survives the call (and, via
+ *  the host's persistence, later calls/processes). `ensureFresh` is awaited
+ *  before the token is read, so a host that knows the expiry can refresh ahead
+ *  of it instead of waiting for a 403. All are optional and best-effort — the
+ *  provider falls back to the static `apiKey` and never lets an accessor
+ *  failure fail the turn. */
+export interface KiroCredentialAccessor {
+  get?: () => string | undefined;
+  set?: (creds: KiroCredentialLike) => void;
+  ensureFresh?: () => Promise<void>;
+}
+
+/** streamKiro options: the shared `SimpleStreamOptions` plus Kiro's optional
+ *  host credential accessor, so typed consumers can pass it without a cast. */
+export interface KiroStreamOptions extends SimpleStreamOptions {
+  credentialAccessor?: KiroCredentialAccessor;
+}
+
 const CAPACITY_LOG_DIR = join(homedir(), ".pi", "logs");
 const CAPACITY_LOG_FILE = join(CAPACITY_LOG_DIR, "capacity-retries.log");
 
@@ -452,7 +483,7 @@ function resolveProviderContext(context: ProviderContext): {
 export function streamKiro(
   model: Model<Api>,
   context: ProviderContext,
-  options?: SimpleStreamOptions,
+  options?: KiroStreamOptions,
 ): AssistantMessageEventStream {
   return streamKiroWithUsageTracking(
     {
@@ -469,7 +500,7 @@ export function streamKiro(
 
 export function createKiroStream(
   usageTracking: KiroUsageTracking,
-): (model: Model<Api>, context: ProviderContext, options?: SimpleStreamOptions) => AssistantMessageEventStream {
+): (model: Model<Api>, context: ProviderContext, options?: KiroStreamOptions) => AssistantMessageEventStream {
   return (model, context, options) => streamKiroWithUsageTracking(usageTracking, model, context, options);
 }
 
@@ -477,7 +508,7 @@ function streamKiroWithUsageTracking(
   usageTracking: KiroUsageTracking,
   model: Model<Api>,
   context: ProviderContext,
-  options?: SimpleStreamOptions,
+  options?: KiroStreamOptions,
 ): AssistantMessageEventStream {
   const {
     messages: contextMessages,
@@ -510,10 +541,42 @@ function streamKiroWithUsageTracking(
       stopReason: "stop",
       timestamp: Date.now(),
     };
+    // Refresh decisions/outcomes for THIS call. Declared outside the try so the
+    // terminal catch can surface it: it makes "the 3 retries failed" decidable
+    // (refresh returned nothing vs. the refreshed token was itself rejected)
+    // instead of invisible on the child's stderr.
+    const refreshTrace: string[] = [];
     try {
-      const initialAccessToken = options?.apiKey;
-      if (!initialAccessToken) throw new Error("Kiro credentials not set. Run /login kiro or install kiro-cli.");
-      let accessToken: string = initialAccessToken;
+      // Credential accessor (optional): a mutable getter/setter the host owns so a
+      // token refreshed mid-call survives the call. Seeded from the accessor when
+      // present, else the static apiKey. Written back after any successful refresh
+      // so the NEXT call — and, via the host's persistence, sibling processes and
+      // later sessions — start from the fresh token instead of paying another 403.
+      // Structural, not nominal: the host passes a plain object, we never import
+      // its type. `set` is best-effort and must never throw into the turn.
+      const credentialAccessor = options?.credentialAccessor;
+      // Proactive refresh: let the host rotate a token it knows is about to
+      // expire before we read it. The reactive 403 retry below stays as the
+      // safety net, so a failed ensureFresh is swallowed, not fatal.
+      try {
+        await credentialAccessor?.ensureFresh?.();
+      } catch {
+        // best-effort — fall through to whatever token the host holds.
+      }
+      const seededToken = credentialAccessor?.get?.() || options?.apiKey;
+      if (!seededToken) throw new Error("Kiro credentials not set. Run /login kiro or install kiro-cli.");
+      let accessToken: string = seededToken;
+      // Persist a refreshed credential back to the host, once, only when the token
+      // actually changed. Never throws: a classification/persist failure must not
+      // fail a turn the refresh just rescued.
+      const writeBackCredential = (creds: KiroCredentialLike, previousToken: string): void => {
+        try {
+          if (!creds?.access || creds.access === previousToken) return;
+          credentialAccessor?.set?.(creds);
+        } catch {
+          // best-effort — the host's persistence is not load-bearing for this turn.
+        }
+      };
       const modelMetadata = model as Model<Api> & {
         kiroModelId?: string;
         kiroRegion?: string;
@@ -541,12 +604,27 @@ function streamKiroWithUsageTracking(
         // Re-read the shared store first, then force a refresh only when it still
         // contains the rejected token. Profile discovery must succeed before the
         // runtime request can be constructed.
+        const rejectedToken = accessToken;
         const storedCreds = getKiroCliCredentials();
-        const freshCreds =
-          storedCreds?.access && storedCreds.access !== accessToken ? storedCreds : refreshViaKiroCli();
-        if (!freshCreds?.access) throw error;
+        const forcedRefresh = !(storedCreds?.access && storedCreds.access !== accessToken);
+        const freshCreds = forcedRefresh ? refreshViaKiroCli() : storedCreds;
+        if (!freshCreds?.access) {
+          refreshTrace.push(
+            forcedRefresh ? "profile-403: refresh returned no token" : "profile-403: store had no fresh token",
+          );
+          throw error;
+        }
+        refreshTrace.push(
+          freshCreds.access === rejectedToken
+            ? "profile-403: refreshed token identical (entitlement?)"
+            : forcedRefresh
+              ? "profile-403: refreshed via kiro-cli"
+              : "profile-403: adopted token from store",
+        );
 
         accessToken = freshCreds.access;
+        // Hand the refreshed credential back to the host so it survives the call.
+        writeBackCredential(freshCreds, rejectedToken);
         managementAuth = { accessToken, region };
         profileArn =
           freshCreds.profileArn ||
@@ -1039,7 +1117,20 @@ function streamKiroWithUsageTracking(
                     : undefined;
               const freshCreds: ReturnType<typeof getKiroCliCredentials> =
                 storedCreds?.access && storedCreds.access !== rejectedAccessToken ? storedCreds : refreshViaKiroCli();
+              const forcedRefresh = !(storedCreds?.access && storedCreds.access !== rejectedAccessToken);
               if (freshCreds?.access) accessToken = freshCreds.access;
+              refreshTrace.push(
+                !freshCreds?.access
+                  ? `runtime-403 #${retryCount}: ${forcedRefresh ? "refresh returned no token" : "store had no fresh token"}`
+                  : freshCreds.access === rejectedAccessToken
+                    ? `runtime-403 #${retryCount}: refreshed token identical (entitlement?)`
+                    : forcedRefresh
+                      ? `runtime-403 #${retryCount}: refreshed via kiro-cli`
+                      : `runtime-403 #${retryCount}: adopted token from store`,
+              );
+              // Hand the refreshed credential back to the host so it survives the
+              // call. Guarded on a genuine change inside writeBackCredential.
+              if (freshCreds?.access) writeBackCredential(freshCreds, rejectedAccessToken);
               managementAuth = { accessToken, region };
 
               // Social profiles may not be discoverable through management.
@@ -1747,7 +1838,16 @@ function streamKiroWithUsageTracking(
           }),
         );
       }
-      debugLog("response.caught", { stopReason: output.stopReason, error: output.errorMessage });
+      // For a host that owns credentials (it passed an accessor), surface this
+      // call's refresh decisions/outcomes onto the terminal error so an auth
+      // failure is decidable in the transcript. Appended on its own line so a
+      // line-oriented classifier still matches the original error grammar on the
+      // first line. Without an accessor the message is unchanged. Never on an
+      // abort — an aborted turn's refresh history is noise.
+      if (options?.credentialAccessor && output.stopReason !== "aborted" && refreshTrace.length > 0) {
+        output.errorMessage = `${output.errorMessage}\n[auth-refresh] ${refreshTrace.join("; ")}`;
+      }
+      debugLog("response.caught", { stopReason: output.stopReason, error: output.errorMessage, refreshTrace });
       stream.push({ type: "error", reason: output.stopReason, error: output });
       stream.end();
     }

@@ -54,6 +54,7 @@ export {
   NON_RETRYABLE_BODY_PATTERNS,
   TOO_BIG_PATTERNS,
 } from "./retry.js";
+export type { KiroCredentialAccessor, KiroCredentialLike, KiroStreamOptions } from "./stream.js";
 export { streamKiro } from "./stream.js";
 export {
   EMPTY_CONTENT_PLACEHOLDER,
