@@ -365,6 +365,42 @@ describe("Feature 7: Thinking Tag Parser", () => {
     expect(deltas(events, "text_delta")).toBe("midend");
   });
 
+  it("materializes an empty region after text without moving it ahead of that text", async () => {
+    const output = makeOutput();
+    const stream = createAssistantMessageEventStream();
+    const parser = new ThinkingTagParser(output, stream);
+
+    // The intersection of the two guarantees: an empty region must still
+    // become its own block, and it must still be appended. The close tag is
+    // what materializes it, so this is the one shape where materialization and
+    // wire ordering are decided by the same call.
+    parser.processChunk("Hello<thinking></thinking>");
+    parser.finalize();
+    stream.end();
+
+    expect(output.content).toEqual([
+      { type: "text", text: "Hello" },
+      { type: "thinking", thinking: "" },
+    ]);
+    expect(parser.getTextBlockIndex()).toBe(0);
+  });
+
+  it("keeps the text index stable when an empty region follows text", async () => {
+    const events = await run(["Hello<thinking></thin", "king>"]);
+    const owner = new Map<number, string>();
+    for (const event of events) {
+      const index = (event as { contentIndex?: number }).contentIndex;
+      if (index === undefined) continue;
+      const kind = event.type.startsWith("thinking") ? "thinking" : "text";
+      const existing = owner.get(index);
+      if (existing === undefined) owner.set(index, kind);
+      else expect(existing).toBe(kind);
+    }
+
+    expect(owner.get(0)).toBe("text");
+    expect(owner.get(1)).toBe("thinking");
+  });
+
   it("getTextBlockIndex points at the last text block across regions", () => {
     const output = makeOutput();
     const stream = createAssistantMessageEventStream();
