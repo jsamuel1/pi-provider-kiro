@@ -4571,7 +4571,7 @@ describe("Feature 9: Streaming Integration", () => {
     expect(msg?.content.filter((b) => b.type === "toolCall")).toHaveLength(0);
     expect(msg?.stopReason).not.toBe("toolUse");
     expect(msg?.errorMessage).toContain("unparseable arguments");
-    expect(msg?.errorMessage).toContain('"bash"');
+    expect(decodedDroppedToolNames(msg?.errorMessage)).toEqual(["bash"]);
     expect(msg?.errorMessage).toContain("never reached the agent");
 
     warnSpy.mockRestore();
@@ -4596,9 +4596,8 @@ describe("Feature 9: Streaming Integration", () => {
     expect(msg?.content.filter((b) => b.type === "toolCall")).toHaveLength(1);
     expect(msg?.stopReason).toBe("toolUse");
     expect(msg?.errorMessage).toContain("tool calls with unparseable arguments");
-    expect(msg?.errorMessage).toContain('"bash"');
-    expect(msg?.errorMessage).toContain('"write"');
-    expect(msg?.errorMessage).not.toContain('"read"');
+    expect(decodedDroppedToolNames(msg?.errorMessage)).toEqual(["bash", "write"]);
+    expect(decodedDroppedToolNames(msg?.errorMessage)).not.toContain("read");
 
     warnSpy.mockRestore();
     vi.unstubAllGlobals();
@@ -4624,7 +4623,7 @@ describe("Feature 9: Streaming Integration", () => {
     const msg = done?.type === "done" ? done.message : undefined;
     expect(msg?.content.filter((b) => b.type === "toolCall")).toHaveLength(0);
     expect(msg?.errorMessage).toContain("unparseable arguments");
-    expect(msg?.errorMessage).toContain('"bash"');
+    expect(decodedDroppedToolNames(msg?.errorMessage)).toEqual(["bash"]);
     expect(msg?.errorMessage).toContain("never reached the agent");
 
     warnSpy.mockRestore();
@@ -4648,7 +4647,7 @@ describe("Feature 9: Streaming Integration", () => {
     const done = events.find((e) => e.type === "done");
     const msg = done?.type === "done" ? done.message : undefined;
     expect(msg?.content.filter((b) => b.type === "toolCall")).toHaveLength(0);
-    expect(msg?.errorMessage).toContain('"bash"');
+    expect(decodedDroppedToolNames(msg?.errorMessage)).toEqual(["bash"]);
 
     warnSpy.mockRestore();
     vi.unstubAllGlobals();
@@ -4846,6 +4845,24 @@ describe("Feature 9: Streaming Integration", () => {
   const CONSUMER_RETRYABLE_RE =
     /overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|stream ended before message_stop|http2 request did not get a response|timed? out|timeout|terminated|retry delay/i;
 
+  /** Reverse the provider's A–P UTF-16 encoding to prove tool identity survives. */
+  function decodedDroppedToolNames(errorMessage: string | undefined): string[] {
+    return [...(errorMessage ?? "").matchAll(/A-P:([A-P]+)/g)].map(([, encoded]) => {
+      if (encoded.length % 4 !== 0) throw new Error(`Malformed diagnostic tool name: ${encoded}`);
+      let decoded = "";
+      for (let i = 0; i < encoded.length; i += 4) {
+        const codeUnit =
+          (encoded.charCodeAt(i) - 65) * 4096 +
+          (encoded.charCodeAt(i + 1) - 65) * 256 +
+          (encoded.charCodeAt(i + 2) - 65) * 16 +
+          encoded.charCodeAt(i + 3) -
+          65;
+        decoded += String.fromCharCode(codeUnit);
+      }
+      return decoded;
+    });
+  }
+
   // Echo lengths whose digits collide with that predicate's HTTP-status
   // alternatives. 5000 is the length used by the capping test above, so the
   // pre-fix `(5000 chars total)` annotation matched `500` and made retry
@@ -4972,14 +4989,14 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   }, 30000);
 
-  it("keeps the dropped-tool-call diagnostic terminal, and free of a call count", async () => {
-    // Many drops in one turn: the count is unbounded, so it is not printed — the
-    // names already enumerate them, and an unbounded integer can collide with the
-    // consumer predicate above exactly as the echo length did.
-    const drops = Array.from(
-      { length: 12 },
-      (_, i) => `{"name":"t${i}","toolUseId":"tc${i}","input":"not-json","stop":true}`,
-    ).join("");
+  it("fingerprints an oversized dropped-name set without emitting a partial identity or call count", async () => {
+    // Many drops in one turn exceed the reversible-name budget. The diagnostic
+    // substitutes one fixed-size whole-set fingerprint instead of slicing a
+    // valid-looking name prefix or dropping later identities silently.
+    const toolNames = Array.from({ length: 12 }, (_, i) => `tool_${i}_${"x".repeat(24)}`);
+    const drops = toolNames
+      .map((name, i) => JSON.stringify({ name, toolUseId: `tc${i}`, input: "not-json", stop: true }))
+      .join("");
     const mockFetch = mockFetchOk(`${drops}{"contextUsagePercentage":10}`);
     vi.stubGlobal("fetch", mockFetch);
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -4990,9 +5007,12 @@ describe("Feature 9: Streaming Integration", () => {
     const done = events.find((e) => e.type === "done");
     const msg = done?.type === "done" ? done.message : undefined;
     expect(msg?.errorMessage).toContain("tool calls with unparseable arguments");
-    expect(msg?.errorMessage).toContain('"t0"');
+    expect(msg?.errorMessage).toMatch(/A-P-DIGEST:[A-P]{64} \(tool identities fingerprinted\)/);
+    expect(decodedDroppedToolNames(msg?.errorMessage)).toEqual([]);
+    expect(msg?.errorMessage).not.toContain(toolNames[0]);
     expect(msg?.errorMessage).toContain("never reached the agent");
     expect(msg?.errorMessage).not.toMatch(/\b12\b/);
+    expect((msg?.errorMessage ?? "").length).toBeLessThan(300);
     expect(CONSUMER_RETRYABLE_RE.exec(msg?.errorMessage ?? "")?.[0]).toBeUndefined();
 
     warnSpy.mockRestore();
@@ -5198,14 +5218,12 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   }, 60000);
 
-  it("quotes a digit-bearing tool name as received, the accepted residual of naming the call", async () => {
-    // Documented residual, pinned so it is discoverable rather than a surprise.
-    // The invariant is that no integer THIS CODE composes reaches a persisted
-    // diagnostic; a tool name is wire text, chosen by the model, and reporting
-    // which call was lost is the whole point of the drop diagnostic. So a tool
-    // named `http500_probe` does collide with the consumer predicate's bare `500`
-    // alternative, and mangling the name to avoid that would defeat the purpose.
-    const dropped = '{"name":"http500_probe","toolUseId":"tc1","input":"not-json","stop":true}';
+  it("keeps a malformed non-string tool name observable without crashing", async () => {
+    // parseKiroEvent currently accepts any truthy JSON `name` and casts it to a
+    // string. Preserve that malformed wire identity instead of throwing on a
+    // string-only method and replacing the dropped-call fact with a generic error.
+    const malformedName = ["bash"];
+    const dropped = JSON.stringify({ name: malformedName, toolUseId: "tc1", input: "not-json", stop: true });
     const mockFetch = mockFetchOk(`${dropped}{"contextUsagePercentage":10}`);
     vi.stubGlobal("fetch", mockFetch);
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -5215,13 +5233,39 @@ describe("Feature 9: Streaming Integration", () => {
 
     const done = events.find((e) => e.type === "done");
     const msg = done?.type === "done" ? done.message : undefined;
-    // The name is reported verbatim — that is the deliberate choice.
-    expect(msg?.errorMessage).toContain('"http500_probe"');
-    // And the collision it causes is real, not hypothetical. Asserted so that a
-    // future attempt to widen the invariant's claim has to confront it.
-    expect(CONSUMER_RETRYABLE_RE.exec(msg?.errorMessage ?? "")?.[0]).toBe("500");
+    expect(decodedDroppedToolNames(msg?.errorMessage)).toEqual(['object:["bash"]']);
+    expect(CONSUMER_RETRYABLE_RE.exec(msg?.errorMessage ?? "")?.[0]).toBeUndefined();
+    expect(events.some((event) => event.type === "error")).toBe(false);
 
     warnSpy.mockRestore();
     vi.unstubAllGlobals();
   });
+
+  for (const [label, toolName] of [
+    ["HTTP-code name", "http500_probe"],
+    ["retry-word name", "set_timeout"],
+    ["ordinary name", "safe_tool"],
+    ["unpaired-surrogate name", "x\ud800y"],
+  ] as const) {
+    it(`keeps the dropped-call diagnostic terminal while preserving ${label}`, async () => {
+      // Tool names are model-provided text. Names containing HTTP codes or retry
+      // words must not make this terminal failure look transient to consumers.
+      const dropped = JSON.stringify({ name: toolName, toolUseId: "tc1", input: "not-json", stop: true });
+      const mockFetch = mockFetchOk(`${dropped}{"contextUsagePercentage":10}`);
+      vi.stubGlobal("fetch", mockFetch);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+      const events = await collect(stream);
+
+      const done = events.find((e) => e.type === "done");
+      const msg = done?.type === "done" ? done.message : undefined;
+      expect(decodedDroppedToolNames(msg?.errorMessage)).toEqual([toolName]);
+      expect(CONSUMER_RETRYABLE_RE.exec(msg?.errorMessage ?? "")?.[0]).toBeUndefined();
+      expect(msg?.errorMessage).not.toContain(toolName);
+
+      warnSpy.mockRestore();
+      vi.unstubAllGlobals();
+    });
+  }
 });

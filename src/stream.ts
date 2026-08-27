@@ -1,6 +1,7 @@
 // ABOUTME: Core streaming integration for Kiro API requests and responses.
 // ABOUTME: Handles request building, retry logic, event parsing, and token counting.
 
+import { createHash } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -209,12 +210,12 @@ function describeAttempts(count: number): string {
 }
 
 /**
- * Cap for wire-derived text quoted into a persisted `errorMessage`. The echoed
- * response and the tool names both come from the model, and this string is
- * written into the assistant record, so neither may be quoted unbounded: the
+ * Cap for wire-derived echo text quoted into a persisted `errorMessage`. The
  * echo pattern `/^\s*(continue|\.+)\s*$/i` admits an arbitrarily long run of
- * dots. Matches the 200-char cap already used for raw tool input in
- * `emitToolCall`'s parse warning below.
+ * dots, and this string is written into the assistant record. Matches the
+ * 200-char cap already used for raw tool input in `emitToolCall`'s parse warning
+ * below. Tool-name collections use their own whole-value policy in
+ * `describeDroppedToolNames`; they are never sliced into partial identities.
  */
 const DIAGNOSTIC_QUOTE_LIMIT = 200;
 
@@ -231,16 +232,67 @@ const DIAGNOSTIC_QUOTE_LIMIT = 200;
  * `console.warn`, which no classifier reads. The only integer these diagnostics
  * interpolate is the observed-attempt count, bounded by `maxRetries + 1` = 4.
  *
- * Residual: a tool NAME is model-chosen and quoted verbatim, so the invariant
- * holds only for the integers this code composes — not for wire text. A tool
- * called `set_timeout` matches that predicate's `timeout` alternative, and one
- * called `http500_probe` matches the bare `500` alternative just as the removed
- * `(5000 chars total)` annotation did. Mangling the name would defeat the point
- * of reporting which call was lost, so it is quoted as received and the
- * collision is accepted.
+ * Wire-derived tool names can carry the same trigger text, so they are encoded
+ * before entering this diagnostic. See `encodeToolNameForDiagnostic`.
  */
 function clampForDiagnostic(text: string): string {
   return text.length <= DIAGNOSTIC_QUOTE_LIMIT ? text : `${text.slice(0, DIAGNOSTIC_QUOTE_LIMIT)}… (truncated)`;
+}
+
+/**
+ * Encode untrusted bytes without letting their text change how a consumer
+ * classifies the surrounding error. Each byte is represented by two letters,
+ * A through P, for its high and low nibbles. That alphabet contains no digits
+ * and cannot spell any alternative in Kermes' retryable-error predicate.
+ */
+function encodeBytesForDiagnostic(bytes: Uint8Array): string {
+  let encoded = "";
+  for (const byte of bytes) {
+    encoded += String.fromCharCode(65 + (byte >> 4), 65 + (byte & 0x0f));
+  }
+  return encoded;
+}
+
+/**
+ * Encode one tool-name identity reversibly from its UTF-16 code units. String
+ * names retain their exact value. A malformed non-string wire name is prefixed
+ * with its runtime type and JSON representation, so it stays distinguishable
+ * from a legitimate string with the same rendered text.
+ *
+ * Using `TextEncoder` here would replace an unpaired surrogate with U+FFFD,
+ * corrupting the only persisted identity of a dropped call; JSON permits that
+ * escaped shape and the event parser carries it through as a JavaScript string.
+ * Quoting any identity verbatim is unsafe: values such as `set_timeout` and
+ * `http500_probe` make a terminal diagnostic look transient to consumers.
+ */
+function encodeToolNameForDiagnostic(name: unknown): string {
+  const identity = typeof name === "string" ? name : `${typeof name}:${JSON.stringify(name)}`;
+  let encoded = "";
+  for (let i = 0; i < identity.length; i++) {
+    const codeUnit = identity.charCodeAt(i);
+    encoded += String.fromCharCode(
+      65 + (codeUnit >> 12),
+      65 + ((codeUnit >> 8) & 0x0f),
+      65 + ((codeUnit >> 4) & 0x0f),
+      65 + (codeUnit & 0x0f),
+    );
+  }
+  return encoded;
+}
+
+/**
+ * Describe the complete dropped-name set without unbounded output or partial
+ * identities. A set that fits is reversible name by name. If the complete set
+ * would exceed the diagnostic limit, replace all names with one SHA-256
+ * fingerprint. The explicit marker means no valid-looking name prefix can be
+ * mistaken for the whole identity, while the fingerprint still lets two
+ * records be compared exactly.
+ */
+function describeDroppedToolNames(names: unknown[]): string {
+  const encoded = names.map((name) => `A-P:${encodeToolNameForDiagnostic(name)}`).join(", ");
+  if (encoded.length <= DIAGNOSTIC_QUOTE_LIMIT) return encoded;
+  const digest = createHash("sha256").update(JSON.stringify(names)).digest();
+  return `A-P-DIGEST:${encodeBytesForDiagnostic(digest)} (tool identities fingerprinted)`;
 }
 
 /**
@@ -934,7 +986,7 @@ export function streamKiro(
         /** Names of tool calls `emitToolCall` refused because their arguments would
          *  not parse. Per-attempt, like `emittedToolCalls`: a retry must not inherit
          *  a discarded attempt's drops. */
-        const droppedToolCalls: string[] = [];
+        const droppedToolCalls: unknown[] = [];
         let currentToolCall: KiroToolCallState | null = null;
         const flushToolCall = () => {
           if (!currentToolCall) return;
@@ -1333,11 +1385,11 @@ export function streamKiro(
         // exhaustion cases, this one is unrecoverable downstream: the call is gone
         // before the message is persisted.
         if (droppedToolCalls.length > 0) {
-          const names = clampForDiagnostic(droppedToolCalls.map((name) => JSON.stringify(name)).join(", "));
-          // The names enumerate the drops, so the count is not printed: it is
-          // unbounded (a turn may carry any number of malformed calls) and an
-          // unbounded integer here can collide with a consumer's retryable-error
-          // pattern — see `clampForDiagnostic`.
+          const names = describeDroppedToolNames(droppedToolCalls);
+          // The reversible names or whole-set fingerprint identify the drops, so
+          // the count is not printed: it is unbounded (a turn may carry any
+          // number of malformed calls) and unbounded or wire-controlled text
+          // here can collide with a consumer's retryable-error pattern.
           const one = droppedToolCalls.length === 1;
           const dropDiagnostic = `Kiro sent ${one ? "a tool call" : "tool calls"} with unparseable arguments (${names}); ${
             one ? "it was" : "they were"
