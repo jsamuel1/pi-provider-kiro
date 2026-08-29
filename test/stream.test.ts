@@ -11,6 +11,7 @@ import type {
 import { isContextOverflow } from "@earendil-works/pi-ai/compat";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { findJsonEnd } from "../src/bracket-tool-parser.js";
+import { isModeledContextOverflowStopReason, KIRO_MODELED_STOP_REASONS } from "../src/diagnostics.js";
 import { capacityRetryConfig, retryConfig } from "../src/retry.js";
 import { resetProfileArnCache, streamKiro } from "../src/stream.js";
 import type { KiroUsage, KiroUsageProvenance } from "../src/token-usage.js";
@@ -3816,6 +3817,7 @@ describe("turn provenance diagnostic", () => {
     return {
       msg: done?.type === "done" ? done.message : error?.type === "error" ? error.error : undefined,
       terminal: done ? "done" : "error",
+      doneReason: done?.type === "done" ? done.reason : undefined,
     };
   }
 
@@ -3971,6 +3973,25 @@ describe("turn provenance diagnostic", () => {
     expect(stopReasonOf(msg).source).toBe("inferred");
   });
 
+  it("keeps an overflowed turn exactly recoverable despite emitting the lossy stop", async () => {
+    // The decision to emit "stop" is only defensible while the fact survives
+    // intact, so pin the whole recovery path a consumer has: the verbatim wire
+    // member, the derived flag, and the shared predicate all agree, and the
+    // emitted value is distinguishable from a genuine END_TURN by them alone.
+    const overflow = await run(['{"content":"Partial"}', '{"stopReason":"MODEL_CONTEXT_WINDOW_EXCEEDED"}']);
+    const clean = await run(['{"content":"Done"}', '{"stopReason":"END_TURN"}']);
+
+    expect(overflow.msg?.stopReason).toBe(clean.msg?.stopReason);
+    const overflowStop = stopReasonOf(overflow.msg);
+    expect(overflowStop.modeled).toBe(KIRO_MODELED_STOP_REASONS.contextWindowExceeded);
+    expect(isModeledContextOverflowStopReason(overflowStop.modeled as string)).toBe(true);
+    expect(overflowStop.contextOverflow).toBe(true);
+
+    const cleanStop = stopReasonOf(clean.msg);
+    expect(isModeledContextOverflowStopReason(cleanStop.modeled as string)).toBe(false);
+    expect(cleanStop.contextOverflow).toBeUndefined();
+  });
+
   it("emits stop, not length, for END_TURN when no contextUsage frame arrives", async () => {
     // The metadataEvent alone settles the turn. Before the modeled value was
     // consumed, only a contextUsageEvent flipped the settled flag, so this
@@ -4002,13 +4023,18 @@ describe("turn provenance diagnostic", () => {
     // wasPreviousResponseTruncated() offer the continuation the turn needs.
     // Before the modeled value was consumed, a contextUsage frame with no tool
     // calls emitted "stop" and the truncation was silently swallowed.
-    const { msg } = await run([
+    const { msg, terminal, doneReason } = await run([
       '{"content":"A partial ans"}',
       '{"stopReason":"MAX_TOKENS"}',
       '{"contextUsagePercentage":42}',
     ]);
 
     expect(msg?.stopReason).toBe("length");
+    // The terminal event carries it too. A done event's `reason` admits
+    // "length", so a modeled truncation must reach the caller as one there as
+    // well rather than being flattened into a stop by the push site.
+    expect(terminal).toBe("done");
+    expect(doneReason).toBe("length");
     expect(wasPreviousResponseTruncated([msg as AssistantMessage])).toBe(true);
     expect(stopReasonOf(msg)).toEqual({ emitted: "length", source: "modeled", modeled: "MAX_TOKENS" });
   });

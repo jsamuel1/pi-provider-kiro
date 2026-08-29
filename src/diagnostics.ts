@@ -52,6 +52,18 @@ export const KIRO_MODELED_STOP_REASONS = {
    * to read this field to find out — {@link mapModeledStopReason} deliberately
    * declines to route it to pi's `"length"`, because that member asks for a
    * continuation, which is the one thing an overflowed context must not get.
+   *
+   * The alternative was considered and rejected: routing this to `"length"`
+   * would reach `wasPreviousResponseTruncated()`, which prepends
+   * TRUNCATION_NOTICE and asks the model to carry on — sending the same
+   * already-overflowing context back plus a notice, so the next turn overflows
+   * again and the loop does not converge. `"stop"` is admittedly lossy in pi's
+   * vocabulary, which has no overflow member, so the loss is confined to a
+   * *label* while the fact stays exactly recoverable: `modeled` carries the
+   * verbatim member, {@link KiroStopReasonRecord.contextOverflow} is set, and
+   * {@link isModeledContextOverflowStopReason} is the shared predicate. A
+   * mislabelled non-terminating retry loop would not be recoverable at all.
+   * Revisit if pi gains a member that means "stop and compact".
    */
   contextWindowExceeded: "MODEL_CONTEXT_WINDOW_EXCEEDED",
   /**

@@ -22,11 +22,7 @@ import { UniversalEventStreamMarshaller } from "@smithy/core/event-streams";
 import type { Message } from "@smithy/types";
 import { parseBracketToolCalls } from "./bracket-tool-parser.js";
 import { debugEnabled, debugLog, formatSafeError, redactSensitiveText } from "./debug.js";
-import {
-  createKiroTurnProvenanceDiagnostic,
-  type KiroStopReasonSource,
-  mapModeledStopReason,
-} from "./diagnostics.js";
+import { createKiroTurnProvenanceDiagnostic, type KiroStopReasonSource, mapModeledStopReason } from "./diagnostics.js";
 import {
   buildKiroAdditionalModelRequestFields,
   getKiroEffortConfig,
@@ -972,8 +968,15 @@ export function streamKiro(
           // said something else, the emitted value is this provider's decision.
           if (modeledStopReason === "toolUse") stopReasonSource = "modeled";
         } else if (modeledStopReason !== undefined) {
-          // `toolUse` is unreachable here: it is gated on an emitted tool call,
-          // and this branch runs only when there is none.
+          // `toolUse` IS reachable here: the service says TOOL_USE and every tool
+          // call it sent was dropped for empty or unparseable input, so
+          // `emittedToolCalls` is 0 while the modeled value still asks for tools.
+          // Emitting `"toolUse"` with no tool call on the message stalls pi's
+          // agent loop waiting for results that will never arrive, so the wire is
+          // overruled and the source stays `"inferred"` — the emitted value is
+          // this provider's decision, and the service's TOOL_USE survives on the
+          // diagnostic. `test/stream.test.ts` pins this case ("records TOOL_USE
+          // when every tool call was dropped").
           output.stopReason = modeledStopReason === "toolUse" ? "stop" : modeledStopReason;
           stopReasonSource = modeledStopReason === "toolUse" ? "inferred" : "modeled";
         } else if (!sawSettlingFrame) {
@@ -1012,7 +1015,17 @@ export function streamKiro(
           // turn that otherwise completed.
           debugLog("diagnostics.failed", { error: formatSafeError(e) });
         }
-        stream.push({ type: "done", reason: output.stopReason as "stop" | "toolUse", message: output });
+        // `output.stopReason` is the full `StopReason` union; a done event takes
+        // only the three non-failure members, so `error`/`aborted` are excluded.
+        // `"length"` belongs in that set and is now a first-class outcome here:
+        // a modeled MAX_TOKENS routes to it, so narrowing the cast to
+        // `"stop" | "toolUse"` would tell a reader this event can never report a
+        // truncation when it routinely does.
+        stream.push({
+          type: "done",
+          reason: output.stopReason as "stop" | "length" | "toolUse",
+          message: output,
+        });
         debugLog("response.done", {
           stopReason: output.stopReason,
           emittedToolCalls,
