@@ -772,6 +772,16 @@ export function streamKiro(
         stream.push({ type: "start", partial: output });
         if (!response.body) throw new Error("No response body");
         const bodyReader = (response.body as unknown as ReadableStream<Uint8Array>).getReader();
+        // Cancel the body read as soon as the caller aborts (e.g. user presses
+        // Esc mid-stream). Without this, the read loop below keeps consuming
+        // the event stream until the server finishes the response, which makes
+        // an interrupt appear to hang for the remainder of the generation.
+        const callerSignal = options?.signal;
+        const onCallerStreamAbort = () => {
+          void bodyReader.cancel().catch(() => {});
+        };
+        if (callerSignal?.aborted) onCallerStreamAbort();
+        else callerSignal?.addEventListener("abort", onCallerStreamAbort, { once: true });
         let totalContent = "";
         let lastContentData = "";
         let usageEvent: { inputTokens?: number; outputTokens?: number } | null = null;
@@ -851,6 +861,7 @@ export function streamKiro(
         const iterator = eventStream[Symbol.asyncIterator]() as AsyncIterator<Record<string, unknown>>;
 
         while (true) {
+          if (callerSignal?.aborted) break;
           let iterResult: IteratorResult<Record<string, unknown>>;
           try {
             if (!gotFirstToken) {
@@ -970,6 +981,13 @@ export function streamKiro(
           if (streamError) break;
         }
         if (idleTimer) clearTimeout(idleTimer);
+        callerSignal?.removeEventListener("abort", onCallerStreamAbort);
+        if (callerSignal?.aborted) {
+          // Surface the abort instead of treating the cancelled read as a
+          // retryable stream error; the outer catch maps this to
+          // stopReason "aborted".
+          throw callerSignal.reason ?? new Error("Request aborted");
+        }
         if (firstTokenTimedOut || idleCancelled || streamError) {
           // Timed out or received error mid-stream: retry with backoff
           if (retryCount < maxRetries) {
