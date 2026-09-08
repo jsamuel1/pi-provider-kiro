@@ -7,14 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Resolve `ksk_` API key profiles through GetProfile instead of ListAvailableProfiles, which returns 403 Unsupported token type. Catalog queries then use that ARN in us-east-1. `KIRO_PROFILE_ARN` still wins.
+
+- Preserve canonical `developer` messages emitted by newer Pi-compatible hosts by lowering them to Kiro user input. Agent reminders and advisories previously degraded to the neutral `"Please proceed with the task."` placeholder when current, and disappeared from historical context entirely.
+
+### Changed
+
+- Write the catalog cache to ~/.pi/agent/kiro-management-models-cache.json, still reading the legacy ~/.kiro-management-models-cache.json path.
+
+- At startup (and when the host refreshModels hook has no credential), scan KIRO_API_KEY then kiro-cli then Kiro IDE and refresh the catalog without blocking registration.
+
+## [0.10.2] - 2026-08-31
+
 ### Added
 
-- The entry module now re-exports `KiroManagementHttpError`. The class already shipped in 0.10.0 and is thrown by every management-plane request that returns a non-OK status (profile discovery, model catalog, usage limits) and already caught in `stream.ts`, where a 403 drives the credential-refresh retry — but it was not re-exported from `src/index.ts`, and there is no per-module file to deep-import instead: the build bundles the whole graph into one `dist/index.js`. No behaviour change: the class, its `status` field, and every throw and catch site are unchanged. Same entry-point caveat as the 0.10.0 re-exports — this is the extension entry the pi host loads, not a resolvable npm entry point.
+- Support kiro-cli external IdP credentials, so a kiro-cli session authenticated through an external identity provider can be reused by the provider instead of forcing a separate login ([#134](https://github.com/mikeyobrien/pi-provider-kiro/pull/134)).
+- OAuth rework: interactive login, API key support, and PKCE social login ([#135](https://github.com/mikeyobrien/pi-provider-kiro/pull/135)).
+- Keep the newest bounded image in history so follow-ups like "look at that image again" still resolve. The newest image-bearing turn is retained when its payload fits 512KB of base64; older turns are still stripped, and an oversized newest set is dropped rather than substituting an older image. Retention is conditional on the model actually accepting images, and `gpt-5.6-luna`'s vision capability is now mapped correctly with stale cache entries corrected on read ([#138](https://github.com/mikeyobrien/pi-provider-kiro/pull/138)).
+- Export Kiro's reason-code vocabulary as a frozen `KIRO_REASON_CODES` record and re-export the `isTooBigError` / `isNonRetryableBodyError` / `isCapacityError` classification predicates from the entry point, so consumers stop hardcoding drifting copies of the same service strings ([#115](https://github.com/mikeyobrien/pi-provider-kiro/pull/115)). The same change makes the published entry point actually resolvable and loadable: `main`/`types` are declared, declarations are emitted, the esbuild bundle gains the `createRequire` banner its bundled CJS graph needs, and the pi host packages are declared as optional peerDependencies. `test/packaging.test.ts` pins the whole contract.
+- The entry module now re-exports `KiroManagementHttpError` ([#144](https://github.com/mikeyobrien/pi-provider-kiro/pull/144)). The class already shipped in 0.10.0 and is thrown by every management-plane request that returns a non-OK status (profile discovery, model catalog, usage limits) and already caught in `stream.ts`, where a 403 drives the credential-refresh retry — but it was not re-exported from `src/index.ts`, and there is no per-module file to deep-import instead: the build bundles the whole graph into one `dist/index.js`. No behaviour change: the class, its `status` field, and every throw and catch site are unchanged. Same entry-point caveat as the 0.10.0 re-exports — this is the extension entry the pi host loads, not a resolvable npm entry point.
 
 ### Fixed
 
-- Normalize cross-provider tool-call IDs before sending them to Kiro. OpenAI Responses persists compound IDs such as `call_…|fc_…` that exceed Kiro's 64-character limit and contain an unsupported pipe, which previously wedged a session with `400 REQUEST_BODY_INVALID` after switching models. Native Kiro IDs remain unchanged, while remapped tool uses and results retain the same deterministic ID.
-- Profile discovery now continues probing the remaining canonical management regions after a regional 403 on ListAvailableProfiles, instead of aborting on the primary region. A region-mismatched token whose profile lives in another canonical region (e.g. us-east-1 token, eu-central-1 profile) previously surfacing `ListAvailableProfiles failed in <region>: 403 Forbidden` now resolves correctly (#131). A 403 on every region is still rethrown so credential refresh/retry paths (#107) engage for genuine auth failures.
+- Normalize cross-provider tool-call IDs before sending them to Kiro. OpenAI Responses persists compound IDs such as `call_…|fc_…` that exceed Kiro's 64-character limit and contain an unsupported pipe, which previously wedged a session with `400 REQUEST_BODY_INVALID` after switching models. Native Kiro IDs remain unchanged, while remapped tool uses and results retain the same deterministic ID ([#137](https://github.com/mikeyobrien/pi-provider-kiro/pull/137)).
+- Profile discovery now continues probing the remaining canonical management regions after a regional 403 on ListAvailableProfiles, instead of aborting on the primary region. A region-mismatched token whose profile lives in another canonical region (e.g. us-east-1 token, eu-central-1 profile) previously surfacing `ListAvailableProfiles failed in <region>: 403 Forbidden` now resolves correctly ([#131](https://github.com/mikeyobrien/pi-provider-kiro/issues/131)). A 403 on every region is still rethrown so credential refresh/retry paths (#107) engage for genuine auth failures.
+- Refresh credentials from the credential's own auth family. The refresh cascade previously handed an IdC session a social account's token (a different identity with a different profile ARN) and returned always-IdC Kiro IDE credentials for social sessions; every source lookup is now filtered by the credential's derived auth family ([#142](https://github.com/mikeyobrien/pi-provider-kiro/pull/142)).
+- Bound Kiro response header waits and coordinate request throttles, so a stalled response no longer hangs a turn indefinitely ([#136](https://github.com/mikeyobrien/pi-provider-kiro/pull/136)).
 
 ## [0.10.1] - 2026-08-24
 
@@ -235,7 +255,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial release: 17 models across 7 families, OAuth device code flow, kiro-cli SQLite credential fallback, streaming pipeline with thinking tag parser
 
-[Unreleased]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.9.3...HEAD
+[Unreleased]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.10.2...HEAD
+[0.10.2]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.9.3...v0.10.0
 [0.9.3]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.9.2...v0.9.3

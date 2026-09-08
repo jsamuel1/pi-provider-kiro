@@ -193,7 +193,10 @@ function mockFetchChunked(chunks: string[]) {
   readMock.mockResolvedValueOnce({ done: true, value: undefined });
   return vi.fn().mockResolvedValueOnce({
     ok: true,
-    body: { getReader: () => ({ read: readMock, releaseLock: () => {} }), cancel: async () => {} },
+    body: {
+      getReader: () => ({ read: readMock, releaseLock: () => {}, cancel: async () => {} }),
+      cancel: async () => {},
+    },
   });
 }
 
@@ -1084,7 +1087,10 @@ describe("Feature 9: Streaming Integration", () => {
     });
     const mockFetch = vi.fn().mockResolvedValueOnce({
       ok: true,
-      body: { getReader: () => ({ read: readMock, releaseLock: () => {} }), cancel: async () => {} },
+      body: {
+        getReader: () => ({ read: readMock, releaseLock: () => {}, cancel: async () => {} }),
+        cancel: async () => {},
+      },
     });
     vi.stubGlobal("fetch", mockFetch);
 
@@ -1096,6 +1102,50 @@ describe("Feature 9: Streaming Integration", () => {
     expect(error?.type === "error" && error.error.stopReason).toBe("aborted");
     // Should have partial content from first chunk
     expect(error?.type === "error" && error.error.content.length).toBeGreaterThanOrEqual(0);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("cancels a pending body read when the signal fires (no hang until server finishes)", async () => {
+    const ac = new AbortController();
+    let pendingReject: ((e: unknown) => void) | undefined;
+    let cancelled = false;
+    const readMock = vi
+      .fn()
+      .mockImplementationOnce(async () => ({ done: false, value: encodeBody('{"content":"chunk1"}') }))
+      // Second read never resolves on its own — simulates a slow generation.
+      // It only rejects when cancel() is invoked, like a real reader.
+      .mockImplementation(
+        () =>
+          new Promise((_, reject) => {
+            pendingReject = reject;
+          }),
+      );
+    const mockFetch = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: readMock,
+          releaseLock: () => {},
+          cancel: async () => {
+            cancelled = true;
+            pendingReject?.(new DOMException("The operation was aborted", "AbortError"));
+          },
+        }),
+        cancel: async () => {},
+      },
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok", signal: ac.signal });
+    // Abort once the stream is mid-read.
+    setTimeout(() => ac.abort(), 20);
+    const events = await collect(stream);
+
+    expect(cancelled).toBe(true);
+    const error = events.find((e) => e.type === "error");
+    expect(error).toBeDefined();
+    expect(error?.type === "error" && error.error.stopReason).toBe("aborted");
 
     vi.unstubAllGlobals();
   });
@@ -2138,13 +2188,11 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
-  // The observed failure: a host appended a reminder message carrying a role
-  // outside pi-ai's `Message` union ("developer") after a settled assistant
-  // turn. None of the current-message branches matched it, so `content` went
-  // out empty and Kiro answered 400 REQUEST_BODY_INVALID — which the provider
-  // then relabeled `context_length_exceeded`, sending the caller into a
-  // compaction loop against a request that was structurally invalid, not large.
-  it("sends placeholder content when the turn ends on an unrecognized role", async () => {
+  // Newer Pi-compatible hosts convert application-specific messages to the
+  // canonical `developer` role before provider dispatch. Kiro has no distinct
+  // developer wire role, so those messages must retain their content as user
+  // input rather than degrade to EMPTY_CONTENT_PLACEHOLDER.
+  it("preserves a current developer message as Kiro user input", async () => {
     const settledAssistant: AssistantMessage = {
       role: "assistant",
       content: [{ type: "text", text: "Done." }],
@@ -2176,9 +2224,48 @@ describe("Feature 9: Streaming Integration", () => {
     const events = await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
 
     const currentMsg = JSON.parse(mockFetch.mock.calls[0][1].body).conversationState.currentMessage.userInputMessage;
-    expect(currentMsg.content).not.toBe("");
+    expect(currentMsg.content).toBe("<system-reminder>2 incomplete todos</system-reminder>");
     expect(events.some((event) => event.type === "done")).toBe(true);
     expect(events.some((event) => event.type === "error")).toBe(false);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("preserves a historical developer message in Kiro history", async () => {
+    const advisory = {
+      role: "developer",
+      content: [{ type: "text", text: '<advisory severity="concern">STOP_AND_REPORT</advisory>' }],
+      attribution: "agent",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: "Investigate", timestamp: ts },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Working." }],
+          api: "kiro-api",
+          provider: "kiro",
+          model: "claude-sonnet-4-5",
+          usage: zeroUsage,
+          stopReason: "stop",
+          timestamp: ts,
+        },
+        advisory as unknown as Context["messages"][number],
+        { role: "user", content: "Continue", timestamp: ts + 1 },
+      ],
+      tools: [],
+    };
+    const mockFetch = mockFetchOk('{"content":"Continuing."}{"contextUsagePercentage":4}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const historicalAdvisory = sent.conversationState.history.at(-1).userInputMessage;
+    expect(historicalAdvisory.content).toBe('<advisory severity="concern">STOP_AND_REPORT</advisory>');
+    expect(sent.conversationState.currentMessage.userInputMessage.content).toBe("Continue");
 
     vi.unstubAllGlobals();
   });
