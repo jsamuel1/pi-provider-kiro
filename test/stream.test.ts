@@ -5483,15 +5483,12 @@ describe("Feature 9: Streaming Integration", () => {
     expect(msg?.errorMessage).toContain("on 1 attempt;");
     expect(msg?.errorMessage).not.toMatch(/\b1 attempts\b/);
     expect(msg?.errorMessage).not.toContain("on 4 attempts");
-    // Attempts 1-3 each streamed "partial" before failing, and `output.content` is
-    // NOT reset on the mid-stream-error retry (only on the degenerate one), so the
-    // persisted message still holds those three discarded text blocks while
-    // `hasText` is false. The diagnostic must not read "returning only text
-    // content" here — that contradicts its own "no text" clause in the same
-    // sentence. It has to say whose text it is.
-    expect(msg?.content.filter((b) => b.type === "text")).toHaveLength(3);
-    expect(msg?.errorMessage).toContain("returning only text content left by earlier discarded attempts");
-    expect(msg?.errorMessage).not.toContain("returning empty content");
+    // #113 clears abandoned content at every retry boundary. The terminal empty
+    // attempt must therefore not retain the three earlier partial blocks, and
+    // #119's diagnostic must describe that actual empty residue.
+    expect(msg?.content.filter((b) => b.type === "text")).toHaveLength(0);
+    expect(msg?.errorMessage).toContain("returning empty content");
+    expect(msg?.errorMessage).not.toContain("left by earlier discarded attempts");
     expect(CONSUMER_RETRYABLE_RE.exec(msg?.errorMessage ?? "")?.[0]).toBeUndefined();
 
     warnSpy.mockRestore();
@@ -5889,13 +5886,9 @@ describe("Feature 9: Streaming Integration", () => {
   }, 30000);
 
   it("does not say 'no tool calls' and 'returning only toolCall content' in one sentence", async () => {
-    // The same trap as the surviving-text case, one kind over. Each of the first
-    // three attempts emits a PARSEABLE tool call and then dies mid-stream; that
-    // retry path does not reset `output.content` (only the degenerate one does),
-    // so three toolCall blocks accumulate while the whole budget is spent. Attempt
-    // 4 is the first degenerate one, so the diagnostic is written over content it
-    // did not produce. Calling that "returning only toolCall content" contradicts
-    // the "no tool calls" clause beside it.
+    // The first three attempts emit a parseable tool call and then fail
+    // mid-stream. #113 clears those abandoned blocks before the terminal
+    // degenerate attempt, so the #119 diagnostic must report empty residue.
     const toolThenErr = `${'{"name":"bash","toolUseId":"tc1","input":"{\\"cmd\\":\\"ls\\"}","stop":true}'}{"error":"transient"}`;
     const mockFetch = vi
       .fn()
@@ -5912,27 +5905,19 @@ describe("Feature 9: Streaming Integration", () => {
     expect(mockFetch).toHaveBeenCalledTimes(4);
     const done = events.find((e) => e.type === "done");
     const msg = done?.type === "done" ? done.message : undefined;
-    // Three discarded attempts' calls really are still on the message. Leaking them
-    // is pre-existing behaviour; describing them wrongly is what this pins.
-    expect(msg?.content.filter((b) => b.type === "toolCall")).toHaveLength(3);
+    expect(msg?.content.filter((b) => b.type === "toolCall")).toHaveLength(0);
     expect(msg?.errorMessage).toContain("no text and no tool calls on 1 attempt;");
-    expect(msg?.errorMessage).toContain("returning only toolCall content left by earlier discarded attempts");
-    // The exact self-contradiction, spelled out so a regression cannot pass by
-    // merely containing the right substring somewhere else in the sentence.
-    expect(msg?.errorMessage).not.toMatch(/returning only toolCall content with/);
-    expect(msg?.errorMessage).not.toContain("returning empty content");
+    expect(msg?.errorMessage).toContain("returning empty content");
+    expect(msg?.errorMessage).not.toContain("left by earlier discarded attempts");
     expect(CONSUMER_RETRYABLE_RE.exec(msg?.errorMessage ?? "")?.[0]).toBeUndefined();
 
     warnSpy.mockRestore();
     vi.unstubAllGlobals();
   }, 60000);
 
-  it("names its own thinking and a discarded attempt's blocks separately when both survive", async () => {
-    // The partition is per KIND, not per message, and this is the shape that
-    // proves a single boolean cannot express it: a reasoning turn whose thinking
-    // block is its OWN, over text and a toolCall left by discarded attempts. One
-    // flag would either blame this attempt's thinking on a discarded one or claim
-    // the discarded blocks as its own. Both halves have to be said.
+  it("keeps only the terminal attempt's thinking after earlier stream errors", async () => {
+    // The terminal attempt owns the thinking block. #113 has cleared the earlier
+    // attempts' text and tool calls, so #119 must not claim stale residue.
     const rich = `{"content":"partial"}${'{"name":"bash","toolUseId":"tc1","input":"{\\"cmd\\":\\"ls\\"}","stop":true}'}{"error":"transient"}`;
     const mockFetch = vi
       .fn()
@@ -5950,13 +5935,10 @@ describe("Feature 9: Streaming Integration", () => {
     const done = events.find((e) => e.type === "done");
     const msg = done?.type === "done" ? done.message : undefined;
     expect(msg?.content.filter((b) => b.type === "thinking")).toHaveLength(1);
-    expect(msg?.content.filter((b) => b.type === "text")).toHaveLength(3);
-    expect(msg?.content.filter((b) => b.type === "toolCall")).toHaveLength(3);
-    // This attempt's own thinking, then what it inherited -- named apart.
+    expect(msg?.content.filter((b) => b.type === "text")).toHaveLength(0);
+    expect(msg?.content.filter((b) => b.type === "toolCall")).toHaveLength(0);
     expect(msg?.errorMessage).toContain("returning only thinking content");
-    expect(msg?.errorMessage).toContain("plus text and toolCall content left by earlier discarded attempts");
-    // Never the flattened claim that all three kinds are this attempt's.
-    expect(msg?.errorMessage).not.toContain("returning only text and thinking and toolCall content");
+    expect(msg?.errorMessage).not.toContain("left by earlier discarded attempts");
     expect(CONSUMER_RETRYABLE_RE.exec(msg?.errorMessage ?? "")?.[0]).toBeUndefined();
 
     warnSpy.mockRestore();
