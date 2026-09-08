@@ -29,8 +29,8 @@ import {
   type KiroAdditionalModelRequestFields,
 } from "./effort.js";
 import { getKiroEndpoints, getKiroRegionFromEndpoint } from "./endpoints.js";
-import { type KiroErrorData, type KiroUsageData, parseKiroEvent, parseKiroExceptionFrame } from "./event-parser.js";
 import { extractKiroReasonCode, KiroApiError, parseRetryAfterMs } from "./errors.js";
+import { type KiroErrorData, type KiroUsageData, parseKiroEvent, parseKiroExceptionFrame } from "./event-parser.js";
 import {
   addPlaceholderTools,
   assertHistoryWithinLimit,
