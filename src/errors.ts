@@ -22,6 +22,11 @@ const REASON_CODE_MARKERS = [
   "REQUEST_BODY_INVALID",
 ] as const;
 
+// Retry-header units and malformed-value handling are owned by retry.ts.
+// Re-export the canonical helper to preserve this module's public surface
+// without maintaining a second parser that can drift from retry behavior.
+export { parseRetryAfterMs } from "./retry.js";
+
 /** Retries this provider already performed internally before giving up. */
 export interface KiroProviderAttempts {
   /** 403 credential-refresh retries (`exponentialBackoff(n, 500, MAX_RETRY_DELAY)`). */
@@ -82,52 +87,4 @@ export function extractKiroReasonCode(errorText: string): string | undefined {
     }
   }
   return REASON_CODE_MARKERS.find((code) => errorText.includes(code));
-}
-
-/**
- * Read a retry delay from response headers, in milliseconds.
- *
- * Handles `retry-after-ms` (milliseconds), `retry-after` (delay-seconds or
- * HTTP-date per RFC 9110), and `x-ratelimit-reset-after` (seconds). Tolerates a
- * missing/partial `headers` object because test doubles and non-fetch
- * transports do not always provide one.
- */
-export function parseRetryAfterMs(headers: Headers | undefined, now: number = Date.now()): number | undefined {
-  const get = headers?.get?.bind(headers);
-  if (!get) return undefined;
-
-  // Each header is an independent candidate: a malformed value in one must not
-  // suppress a usable value in a later one.
-  const ms = nonNegativeNumber(get("retry-after-ms"));
-  if (ms !== undefined) return Math.round(ms);
-
-  const retryAfter = get("retry-after");
-  if (retryAfter) {
-    const seconds = Number(retryAfter);
-    if (Number.isFinite(seconds)) {
-      // A numeric value is delay-seconds, never a date. Skip Date.parse, which
-      // reads "-5" as a year.
-      if (seconds >= 0) return Math.round(seconds * 1000);
-    } else {
-      const date = Date.parse(retryAfter);
-      // A past date means "retry now", not a negative delay.
-      if (!Number.isNaN(date)) return Math.max(0, date - now);
-    }
-  }
-
-  const resetAfter = nonNegativeNumber(get("x-ratelimit-reset-after"));
-  if (resetAfter !== undefined) return Math.round(resetAfter * 1000);
-
-  return undefined;
-}
-
-/**
- * Parse a header value as a finite, non-negative number.
- * Returns undefined for an absent header (`Number(null)` is 0, which would
- * otherwise read as a legitimate zero delay) and for a malformed value.
- */
-function nonNegativeNumber(value: string | null): number | undefined {
-  if (value === null || value.trim() === "") return undefined;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
 }
