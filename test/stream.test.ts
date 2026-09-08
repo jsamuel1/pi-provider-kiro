@@ -187,7 +187,10 @@ function mockFetchChunked(chunks: string[]) {
   readMock.mockResolvedValueOnce({ done: true, value: undefined });
   return vi.fn().mockResolvedValueOnce({
     ok: true,
-    body: { getReader: () => ({ read: readMock, releaseLock: () => {} }), cancel: async () => {} },
+    body: {
+      getReader: () => ({ read: readMock, releaseLock: () => {}, cancel: async () => {} }),
+      cancel: async () => {},
+    },
   });
 }
 
@@ -1078,7 +1081,10 @@ describe("Feature 9: Streaming Integration", () => {
     });
     const mockFetch = vi.fn().mockResolvedValueOnce({
       ok: true,
-      body: { getReader: () => ({ read: readMock, releaseLock: () => {} }), cancel: async () => {} },
+      body: {
+        getReader: () => ({ read: readMock, releaseLock: () => {}, cancel: async () => {} }),
+        cancel: async () => {},
+      },
     });
     vi.stubGlobal("fetch", mockFetch);
 
@@ -1090,6 +1096,50 @@ describe("Feature 9: Streaming Integration", () => {
     expect(error?.type === "error" && error.error.stopReason).toBe("aborted");
     // Should have partial content from first chunk
     expect(error?.type === "error" && error.error.content.length).toBeGreaterThanOrEqual(0);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("cancels a pending body read when the signal fires (no hang until server finishes)", async () => {
+    const ac = new AbortController();
+    let pendingReject: ((e: unknown) => void) | undefined;
+    let cancelled = false;
+    const readMock = vi
+      .fn()
+      .mockImplementationOnce(async () => ({ done: false, value: encodeBody('{"content":"chunk1"}') }))
+      // Second read never resolves on its own — simulates a slow generation.
+      // It only rejects when cancel() is invoked, like a real reader.
+      .mockImplementation(
+        () =>
+          new Promise((_, reject) => {
+            pendingReject = reject;
+          }),
+      );
+    const mockFetch = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: readMock,
+          releaseLock: () => {},
+          cancel: async () => {
+            cancelled = true;
+            pendingReject?.(new DOMException("The operation was aborted", "AbortError"));
+          },
+        }),
+        cancel: async () => {},
+      },
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok", signal: ac.signal });
+    // Abort once the stream is mid-read.
+    setTimeout(() => ac.abort(), 20);
+    const events = await collect(stream);
+
+    expect(cancelled).toBe(true);
+    const error = events.find((e) => e.type === "error");
+    expect(error).toBeDefined();
+    expect(error?.type === "error" && error.error.stopReason).toBe("aborted");
 
     vi.unstubAllGlobals();
   });
