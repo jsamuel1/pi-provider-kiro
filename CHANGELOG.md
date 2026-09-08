@@ -11,7 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Resolve `ksk_` API key profiles through GetProfile instead of ListAvailableProfiles, which returns 403 Unsupported token type. Catalog queries then use that ARN in us-east-1. `KIRO_PROFILE_ARN` still wins.
 
+- Preserve canonical `developer` messages emitted by newer Pi-compatible hosts by lowering them to Kiro user input. Agent reminders and advisories previously degraded to the neutral `"Please proceed with the task."` placeholder when current, and disappeared from historical context entirely.
+
 ### Changed
+
+- Write the catalog cache to ~/.pi/agent/kiro-management-models-cache.json, still reading the legacy ~/.kiro-management-models-cache.json path.
 
 - At startup (and when the host refreshModels hook has no credential), scan KIRO_API_KEY then kiro-cli then Kiro IDE and refresh the catalog without blocking registration.
 
