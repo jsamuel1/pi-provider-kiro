@@ -8,13 +8,21 @@ import type {
   TextContent,
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
-import { isContextOverflow } from "@earendil-works/pi-ai/compat";
+import { isContextOverflow, isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { findJsonEnd } from "../src/bracket-tool-parser.js";
+import { validateKiroConversation, validateKiroToolStructure } from "../src/history-validator.js";
 import { capacityRetryConfig, retryConfig } from "../src/retry.js";
 import { resetProfileArnCache, streamKiro } from "../src/stream.js";
 import { EMPTY_CONTENT_PLACEHOLDER, type KiroHistoryEntry } from "../src/transform.js";
-import { concatMessages, encodeEventMessage } from "./helpers/event-stream.js";
+import {
+  concatMessages,
+  encodeEventMessage,
+  encodeExceptionMessage,
+  encodeExceptionMessageWithRawBody,
+  encodeRawExceptionMessage,
+} from "./helpers/event-stream.js";
+import { RECORD_279_COMMAND, RECORD_279_SUMMARY, RECORD_279_TEXT } from "./helpers/invoke-fixture.js";
 
 const ts = Date.now();
 const zeroUsage = {
@@ -146,9 +154,9 @@ function encodeBody(body: string): Uint8Array {
   return concatMessages(...parseJsonObjects(body).map((o) => encodeEventMessage(o)));
 }
 
-function mockFetchOk(body: string) {
+function makeOkResponse(body: string): Response {
   const frames = encodeBody(body);
-  return vi.fn().mockResolvedValueOnce({
+  return {
     ok: true,
     body: {
       getReader: () => ({
@@ -160,7 +168,43 @@ function mockFetchOk(body: string) {
       }),
       cancel: async () => {},
     },
-  });
+  } as unknown as Response;
+}
+
+function mockFetchOk(body: string) {
+  return vi.fn().mockResolvedValueOnce(makeOkResponse(body));
+}
+
+function makeRequestRateResponse(headers?: Record<string, string>): Response {
+  return {
+    ok: false,
+    status: 429,
+    statusText: "Too Many Requests",
+    headers: new Headers(headers),
+    text: () => Promise.resolve('{"message":"Please wait before trying again","reason":"USER_REQUEST_RATE_EXCEEDED"}'),
+  } as unknown as Response;
+}
+
+/**
+ * One `fetch` resolution whose reader yields `body` then ends. Unlike
+ * `mockFetchOk` this is the response alone, so a caller can queue several on one
+ * mock to drive the retry loop across attempts.
+ */
+function mockResponseOnce(body: string) {
+  return {
+    ok: true,
+    body: {
+      getReader: () => ({
+        read: vi
+          .fn()
+          .mockResolvedValueOnce({ done: false, value: encodeBody(body) })
+          .mockResolvedValueOnce({ done: true, value: undefined }),
+        releaseLock: () => {},
+        cancel: async () => {},
+      }),
+      cancel: async () => {},
+    },
+  };
 }
 
 function mockFetchChunked(chunks: string[]) {
@@ -171,7 +215,10 @@ function mockFetchChunked(chunks: string[]) {
   readMock.mockResolvedValueOnce({ done: true, value: undefined });
   return vi.fn().mockResolvedValueOnce({
     ok: true,
-    body: { getReader: () => ({ read: readMock, releaseLock: () => {} }), cancel: async () => {} },
+    body: {
+      getReader: () => ({ read: readMock, releaseLock: () => {}, cancel: async () => {} }),
+      cancel: async () => {},
+    },
   });
 }
 
@@ -488,7 +535,12 @@ describe("Feature 9: Streaming Integration", () => {
     const freshProfileArn = "arn:aws:codewhisperer:us-east-1:123:profile/FRESH";
     const mockFetch = vi
       .fn()
+      // Primary (us-east-1): stale token rejected
       .mockResolvedValueOnce({ ok: false, status: 403, statusText: "Forbidden" })
+      // Fallback (eu-central-1): stale token rejected there too — genuine auth rejection,
+      // so the probe rethrows 403 and the #107 newer-credential path engages
+      .mockResolvedValueOnce({ ok: false, status: 403, statusText: "Forbidden" })
+      // Re-probe with the newer kiro-cli token: profile found
       .mockResolvedValueOnce({
         ok: true,
         json: () => Promise.resolve({ profiles: [{ arn: freshProfileArn }] }),
@@ -526,11 +578,14 @@ describe("Feature 9: Streaming Integration", () => {
     const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "stale-token" }));
 
     expect(refreshSpy).not.toHaveBeenCalled();
-    expect(mockFetch).toHaveBeenCalledTimes(3);
+    expect(mockFetch).toHaveBeenCalledTimes(4);
     expect(mockFetch.mock.calls[0][1].headers.Authorization).toBe("Bearer stale-token");
-    expect(mockFetch.mock.calls[1][1].headers.Authorization).toBe("Bearer fresh-token");
+    expect(mockFetch.mock.calls[0][0]).toBe("https://management.us-east-1.kiro.dev/List-Available-Profiles");
+    expect(mockFetch.mock.calls[1][1].headers.Authorization).toBe("Bearer stale-token");
+    expect(mockFetch.mock.calls[1][0]).toBe("https://management.eu-central-1.kiro.dev/List-Available-Profiles");
     expect(mockFetch.mock.calls[2][1].headers.Authorization).toBe("Bearer fresh-token");
-    expect(JSON.parse(mockFetch.mock.calls[2][1].body).profileArn).toBe(freshProfileArn);
+    expect(mockFetch.mock.calls[3][1].headers.Authorization).toBe("Bearer fresh-token");
+    expect(JSON.parse(mockFetch.mock.calls[3][1].body).profileArn).toBe(freshProfileArn);
     expect(events.find((event) => event.type === "done")).toBeDefined();
 
     getCredsSpy.mockRestore();
@@ -543,6 +598,7 @@ describe("Feature 9: Streaming Integration", () => {
     const freshProfileArn = "arn:aws:codewhisperer:us-east-1:123:profile/REFRESHED";
     const mockFetch = vi
       .fn()
+      .mockResolvedValueOnce({ ok: false, status: 403, statusText: "Forbidden" })
       .mockResolvedValueOnce({ ok: false, status: 403, statusText: "Forbidden" })
       .mockResolvedValueOnce({
         ok: true,
@@ -578,10 +634,11 @@ describe("Feature 9: Streaming Integration", () => {
     const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "stale-token" }));
 
     expect(refreshSpy).toHaveBeenCalledOnce();
-    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch).toHaveBeenCalledTimes(3);
     expect(mockFetch.mock.calls[0][1].headers.Authorization).toBe("Bearer stale-token");
-    expect(mockFetch.mock.calls[1][1].headers.Authorization).toBe("Bearer fresh-token");
-    expect(JSON.parse(mockFetch.mock.calls[1][1].body).profileArn).toBe(freshProfileArn);
+    expect(mockFetch.mock.calls[1][1].headers.Authorization).toBe("Bearer stale-token");
+    expect(mockFetch.mock.calls[2][1].headers.Authorization).toBe("Bearer fresh-token");
+    expect(JSON.parse(mockFetch.mock.calls[2][1].body).profileArn).toBe(freshProfileArn);
     expect(events.find((event) => event.type === "done")).toBeDefined();
 
     getCredsSpy.mockRestore();
@@ -611,7 +668,9 @@ describe("Feature 9: Streaming Integration", () => {
 
   it("fails before inference when profile discovery returns no profile", async () => {
     resetProfileArnCache(false);
-    const mockFetch = vi.fn().mockResolvedValueOnce({
+    // Both canonical management regions return an empty profile list (#104):
+    // the provider probes the fallback region before failing to inference.
+    const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
       json: () => Promise.resolve({ profiles: [] }),
     });
@@ -619,8 +678,9 @@ describe("Feature 9: Streaming Integration", () => {
 
     const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
 
-    expect(mockFetch).toHaveBeenCalledOnce();
+    expect(mockFetch).toHaveBeenCalledTimes(2);
     expect(mockFetch.mock.calls[0][0]).toBe("https://management.us-east-1.kiro.dev/List-Available-Profiles");
+    expect(mockFetch.mock.calls[1][0]).toBe("https://management.eu-central-1.kiro.dev/List-Available-Profiles");
     const error = events.find((event) => event.type === "error");
     expect(error?.type === "error" && error.error.errorMessage).toContain("returned no profile");
 
@@ -796,6 +856,123 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
+  it("preserves multiple thinking regions through the streamed response", async () => {
+    const mockFetch = mockFetchChunked([
+      '{"content":"<thinking>first</thinking>\\n\\nmid<rea"}',
+      '{"content":"soning>second</reasoning>\\n\\nend"}',
+      '{"contextUsagePercentage":15}',
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: true }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const thinkingStarts = events.filter((event) => event.type === "thinking_start");
+    const thinkingEnds = events.filter((event) => event.type === "thinking_end");
+
+    expect(thinkingStarts.map((event) => event.contentIndex)).toEqual([0, 2]);
+    expect(thinkingEnds.map((event) => event.contentIndex)).toEqual([0, 2]);
+    expect(thinkingEnds.map((event) => event.content)).toEqual(["first", "second"]);
+
+    const textDeltas = events
+      .filter((event) => event.type === "text_delta")
+      .map((event) => event.delta)
+      .join("");
+    expect(textDeltas).toBe("midend");
+    expect(textDeltas).not.toMatch(/<\/?(?:thinking|think|reasoning|thought)>/);
+
+    const textEnd = events.find((event) => event.type === "text_end");
+    expect(textEnd?.type === "text_end" && [textEnd.contentIndex, textEnd.content]).toEqual([3, "end"]);
+
+    const done = events.find((event) => event.type === "done");
+    const content = done?.type === "done" ? done.message.content : [];
+    expect(content).toEqual([
+      { type: "thinking", thinking: "first" },
+      { type: "text", text: "mid" },
+      { type: "thinking", thinking: "second" },
+      { type: "text", text: "end" },
+    ]);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("preserves empty first and later thinking regions through the streamed response", async () => {
+    const mockFetch = mockFetchChunked([
+      '{"content":"<thought></thought>mid<rea"}',
+      '{"content":"soning></reasoning>end"}',
+      '{"contextUsagePercentage":15}',
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: true }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const thinkingStarts = events.filter((event) => event.type === "thinking_start");
+    const thinkingEnds = events.filter((event) => event.type === "thinking_end");
+
+    expect(thinkingStarts.map((event) => event.contentIndex)).toEqual([0, 2]);
+    expect(thinkingEnds.map((event) => event.contentIndex)).toEqual([0, 2]);
+    expect(thinkingEnds.map((event) => event.content)).toEqual(["", ""]);
+
+    const textDeltas = events
+      .filter((event) => event.type === "text_delta")
+      .map((event) => event.delta)
+      .join("");
+    expect(textDeltas).toBe("midend");
+
+    const textEnd = events.find((event) => event.type === "text_end");
+    expect(textEnd?.type === "text_end" && [textEnd.contentIndex, textEnd.content]).toEqual([3, "end"]);
+
+    const done = events.find((event) => event.type === "done");
+    const content = done?.type === "done" ? done.message.content : [];
+    expect(content).toEqual([
+      { type: "thinking", thinking: "" },
+      { type: "text", text: "mid" },
+      { type: "thinking", thinking: "" },
+      { type: "text", text: "end" },
+    ]);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps one block per contentIndex when thinking arrives after text", async () => {
+    const mockFetch = mockFetchChunked([
+      '{"content":"Hello world"}',
+      '{"content":"<thinking>reasoning"}',
+      '{"content":"</thinking>"}',
+      '{"contextUsagePercentage":15}',
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: true }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const census = events
+      .filter((e) => (e as { contentIndex?: number }).contentIndex !== undefined)
+      .map((e) => `${e.type}@${(e as { contentIndex: number }).contentIndex}`);
+
+    // The parser appends the thinking block, so the text block keeps index 0
+    // for the whole stream and `text_end` names the slot `text_start` opened.
+    // An earlier revision spliced thinking into index 0 and shifted the text
+    // block to 1, which emitted `thinking_start@0` over the already-announced
+    // text block and then `text_end@1` at a slot no `text_start` ever opened —
+    // an index-addressed consumer lost the text and threw on the close.
+    expect(census).toEqual([
+      "text_start@0",
+      "text_delta@0",
+      "thinking_start@1",
+      "thinking_delta@1",
+      "thinking_end@1",
+      "text_end@0",
+    ]);
+
+    const textEnd = events.find((e) => e.type === "text_end");
+    expect(textEnd?.type === "text_end" && textEnd.content).toBe("Hello world");
+
+    const done = events.find((e) => e.type === "done");
+    const content = done?.type === "done" ? done.message.content : [];
+    expect(content.map((b) => b.type)).toEqual(["text", "thinking"]);
+
+    vi.unstubAllGlobals();
+  });
+
   it("does not withhold the tail of plain text in reasoning mode", async () => {
     const mockFetch = mockFetchChunked(['{"content":"Hello world"}', '{"contextUsagePercentage":5}']);
     vi.stubGlobal("fetch", mockFetch);
@@ -932,7 +1109,10 @@ describe("Feature 9: Streaming Integration", () => {
     });
     const mockFetch = vi.fn().mockResolvedValueOnce({
       ok: true,
-      body: { getReader: () => ({ read: readMock, releaseLock: () => {} }), cancel: async () => {} },
+      body: {
+        getReader: () => ({ read: readMock, releaseLock: () => {}, cancel: async () => {} }),
+        cancel: async () => {},
+      },
     });
     vi.stubGlobal("fetch", mockFetch);
 
@@ -944,6 +1124,50 @@ describe("Feature 9: Streaming Integration", () => {
     expect(error?.type === "error" && error.error.stopReason).toBe("aborted");
     // Should have partial content from first chunk
     expect(error?.type === "error" && error.error.content.length).toBeGreaterThanOrEqual(0);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("cancels a pending body read when the signal fires (no hang until server finishes)", async () => {
+    const ac = new AbortController();
+    let pendingReject: ((e: unknown) => void) | undefined;
+    let cancelled = false;
+    const readMock = vi
+      .fn()
+      .mockImplementationOnce(async () => ({ done: false, value: encodeBody('{"content":"chunk1"}') }))
+      // Second read never resolves on its own — simulates a slow generation.
+      // It only rejects when cancel() is invoked, like a real reader.
+      .mockImplementation(
+        () =>
+          new Promise((_, reject) => {
+            pendingReject = reject;
+          }),
+      );
+    const mockFetch = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: readMock,
+          releaseLock: () => {},
+          cancel: async () => {
+            cancelled = true;
+            pendingReject?.(new DOMException("The operation was aborted", "AbortError"));
+          },
+        }),
+        cancel: async () => {},
+      },
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok", signal: ac.signal });
+    // Abort once the stream is mid-read.
+    setTimeout(() => ac.abort(), 20);
+    const events = await collect(stream);
+
+    expect(cancelled).toBe(true);
+    const error = events.find((e) => e.type === "error");
+    expect(error).toBeDefined();
+    expect(error?.type === "error" && error.error.stopReason).toBe("aborted");
 
     vi.unstubAllGlobals();
   });
@@ -1081,7 +1305,7 @@ describe("Feature 9: Streaming Integration", () => {
   // Images in history don't break session (regression)
   // =========================================================================
 
-  it("strips images from history entries so they don't bloat the request", async () => {
+  it("keeps the newest bounded image in history for follow-up recognition", async () => {
     const imageContent: ImageContent = { type: "image", data: "x".repeat(100000), mimeType: "image/png" };
     const context: Context = {
       systemPrompt: "You are helpful",
@@ -1110,11 +1334,9 @@ describe("Feature 9: Streaming Integration", () => {
     expect(done).toBeDefined();
     expect(done?.type === "done" && done.message.stopReason).toBe("stop");
 
-    // History should NOT contain the image base64 data
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     const historyStr = JSON.stringify(body.conversationState.history ?? []);
-    expect(historyStr).not.toContain("x".repeat(1000));
-    // But the history entry text should still be there
+    expect(historyStr).toContain("x".repeat(1000));
     expect(historyStr).toContain("Look at this");
 
     vi.unstubAllGlobals();
@@ -1239,10 +1461,13 @@ describe("Feature 9: Streaming Integration", () => {
     expect(done).toBeDefined();
     expect(done?.type === "done" && done.message.stopReason).toBe("stop");
 
-    // Verify tool results were sent in the request body
+    // Verify tool results were sent in the request body. `content` is empty by
+    // design: Kiro's rule is content **or** toolResults, and this turn's payload
+    // is the toolResults. Filling it with prose would put a sentence the user
+    // never wrote into the conversation as a user utterance.
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     const currentMsg = body.conversationState.currentMessage.userInputMessage;
-    expect(currentMsg.content).toBe("Tool results provided.");
+    expect(currentMsg.content).toBe("");
     expect(currentMsg.userInputMessageContext?.toolResults).toHaveLength(1);
     expect(currentMsg.userInputMessageContext.toolResults[0].toolUseId).toBe("tc1");
 
@@ -1305,12 +1530,18 @@ describe("Feature 9: Streaming Integration", () => {
   });
 
   // =========================================================================
-  // Required `content` field
-  // —————————————————————————————————————————————————————————————————————————
-  // Kiro rejects a current message with an empty `content` as
-  // "Improperly formed request." (reason REQUEST_BODY_INVALID). A turn can
-  // reach the request builder with no text — an image-only user message, or a
-  // user message whose text is empty — so a placeholder must be substituted.
+  // `content` on a payload-less turn vs. a tool turn
+  // ————————————————————————————————————————————————————————————————————
+  // Kiro's rule is content **or** tool results. A turn carrying neither has no
+  // payload at all — an image-only user message, an empty-text user message, or
+  // a host-appended message whose role falls outside pi-ai's `Message` union —
+  // and gets the neutral placeholder so its attachments still reach the model
+  // (#106).
+  //
+  // A tool turn is not that turn: its payload is
+  // `userInputMessageContext.toolResults`, so its `content` stays empty. Both
+  // cases share one line in the request builder, and the guard between them is
+  // load-bearing — see the mutation probe below.
   // =========================================================================
 
   // These use a prior turn so the system prompt is already consumed by the
@@ -1380,13 +1611,610 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
-  // The observed failure: a host appended a reminder message carrying a role
-  // outside pi-ai's `Message` union ("developer") after a settled assistant
-  // turn. None of the current-message branches matched it, so `content` went
-  // out empty and Kiro answered 400 REQUEST_BODY_INVALID — which the provider
-  // then relabeled `context_length_exceeded`, sending the caller into a
-  // compaction loop against a request that was structurally invalid, not large.
-  it("sends placeholder content when the turn ends on an unrecognized role", async () => {
+  // -----------------------------------------------------------------------
+  // The tool-turn side of the same line.
+  //
+  // MUTATION PROBE for the `currentToolResults.length === 0` guard on the
+  // placeholder fallback in stream.ts: widen that condition back to a bare
+  // `if (currentContent === "")` and these three go red with
+  // `EMPTY_CONTENT_PLACEHOLDER` in place of `""`. Without them the whole change
+  // passes while every tool turn is refilled with a different fabricated
+  // sentence — a no-op with new wording.
+  // -----------------------------------------------------------------------
+
+  it("sends empty content on a tool-result turn, with the results as payload", async () => {
+    const assistantWithTool: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tc1", name: "calc", arguments: { a: 2 } }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        ...settledTurn(),
+        assistantWithTool,
+        {
+          role: "toolResult",
+          toolCallId: "tc1",
+          toolName: "calc",
+          content: [{ type: "text", text: "4" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "calc", description: "Calculate", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"4."}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const currentMsg = JSON.parse(mockFetch.mock.calls[0][1].body).conversationState.currentMessage.userInputMessage;
+    expect(currentMsg.content).toBe("");
+    expect(currentMsg.userInputMessageContext.toolResults).toHaveLength(1);
+    expect(currentMsg.userInputMessageContext.toolResults[0].toolUseId).toBe("tc1");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("sends empty content when the turn is tool results alone", async () => {
+    const assistantWithTool: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tc9", name: "calc", arguments: {} }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        ...settledTurn(),
+        assistantWithTool,
+        {
+          role: "toolResult",
+          toolCallId: "tc9",
+          toolName: "calc",
+          content: [{ type: "text", text: "9" }],
+          isError: false,
+          timestamp: ts,
+        },
+        {
+          role: "toolResult",
+          toolCallId: "tc9",
+          toolName: "calc",
+          content: [{ type: "text", text: "9 again" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "calc", description: "Calculate", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"9."}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const currentMsg = JSON.parse(mockFetch.mock.calls[0][1].body).conversationState.currentMessage.userInputMessage;
+    expect(currentMsg.content).toBe("");
+    expect(currentMsg.userInputMessageContext.toolResults.length).toBeGreaterThan(0);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("never puts carrier prose anywhere in a tool-turn request", async () => {
+    const assistantWithTool: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tc1", name: "calc", arguments: {} }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const secondAssistant: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tc2", name: "calc", arguments: {} }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const tr = (id: string, text: string): Context["messages"][number] => ({
+      role: "toolResult",
+      toolCallId: id,
+      toolName: "calc",
+      content: [{ type: "text", text }],
+      isError: false,
+      timestamp: ts,
+    });
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: "do the thing", timestamp: ts },
+        assistantWithTool,
+        tr("tc1", "one"),
+        secondAssistant,
+        tr("tc2", "two"),
+      ],
+      tools: [{ name: "calc", description: "Calculate", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"done"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const body = mockFetch.mock.calls[0][1].body as string;
+    expect(body).not.toContain("Tool results provided");
+    // The one real user utterance survives verbatim.
+    const parsed = JSON.parse(body);
+    expect(parsed.conversationState.history[0].userInputMessage.content).toContain("do the thing");
+
+    vi.unstubAllGlobals();
+  });
+
+  // -----------------------------------------------------------------------
+  // The pre-send REPAIR, exercised through `streamKiro` rather than through
+  // `repairKiroConversation` directly. Unit tests on the validator prove the
+  // rules; only these prove the request builder actually runs them and sends
+  // the repaired bytes.
+  //
+  // MUTATION PROBE: delete the `kiroConversationEntries`/
+  // `repairKiroConversation` block in stream.ts and these go red. Nothing else
+  // in the suite does — `tsc` still passes and biome reports the orphaned
+  // imports as a warning with exit 0.
+  //
+  // Reachability: `sanitizeHistory` repairs orphaned results inside `history`
+  // by synthesizing an `unknown_tool` toolUse, but it tests pairing by POSITION,
+  // so a mismatched PAIR — both partners present, each paired with the other's
+  // counterpart — passes it untouched, and the current message is assembled
+  // after that pass and is not covered by it at all. Both shapes reach the wire
+  // as `400 TOOL_USE_RESULT_MISMATCH` unless repaired here.
+  // -----------------------------------------------------------------------
+
+  // -----------------------------------------------------------------------
+  // The live wedge, 2026-08-14. Two concurrent tool executions interleaved into
+  // one transcript, so a tool result landed paired with the WRONG assistant's
+  // tool use:
+  //
+  //   assistant(toolUses=[A]) / user(text) / assistant(toolUses=[B]) / user(results=[A])
+  //
+  // Kiro answered `400 ... tool_use ids were found without tool_result blocks
+  // immediately after: <B>` and, because the retry resends identical history,
+  // the session was terminally wedged — every subsequent turn 400d.
+  //
+  // `prepareHistory` cannot see it: `sanitizeHistory` tests pairing by POSITION,
+  // and `injectSyntheticToolCalls` only rescues orphaned RESULTS.
+  // -----------------------------------------------------------------------
+  // The branch where repair legitimately removes `userInputMessageContext`
+  // entirely: the carrier's results answer nothing, and the turn declares no
+  // tools, so after stripping there is nothing left to put in the context. This
+  // is the shape a `?? uimc` fallback silently undoes.
+  //
+  // No tools are declared and history contains no `toolUses`, so
+  // `addPlaceholderTools` synthesizes none either — that is what makes the
+  // repaired context empty rather than tools-only.
+  //
+  // MUTATION PROBE: change `wireUimc = repairedCurrent.userInputMessageContext`
+  // to `... ?? uimc` in stream.ts and this goes red — the stripped orphan is put
+  // straight back onto the wire.
+  it("sends no tool context at all when repair strips the only results", async () => {
+    const settledAssistant: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "Done." }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "stop",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: "do it", timestamp: ts },
+        settledAssistant,
+        // Answers `tcZ`, which no assistant turn ever issued.
+        {
+          role: "toolResult",
+          toolCallId: "tcZ",
+          toolName: "calc",
+          content: [{ type: "text", text: "orphan" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const current = sent.conversationState.currentMessage.userInputMessage;
+    expect(current.userInputMessageContext).toBeUndefined();
+    // With no payload left, step 5 gives the turn the neutral prompt.
+    expect(current.content).toBe(EMPTY_CONTENT_PLACEHOLDER);
+    const conversation = [...(sent.conversationState.history ?? []), { userInputMessage: current }];
+    expect(validateKiroConversation(conversation).valid).toBe(true);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("does not flatten reasoning into the current turn's assistant content", async () => {
+    // The history site (`buildHistory`) stopped flattening earlier; this is the
+    // OTHER site, in the current-message assistant branch. It reaches the wire
+    // through the same `assistantResponseMessage.content`, so leaving it flattened
+    // made the parity claim only half true.
+    const withThinking: AssistantMessage = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "deciding which file to read" } as unknown as TextContent,
+        { type: "text", text: "reading it now" },
+        { type: "toolCall", id: "tc9", name: "read", arguments: { path: "/tmp/tc9" } },
+      ],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    } as AssistantMessage;
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [...settledTurn(), withThinking, makeToolResult("tc9")],
+      tools: [{ name: "read", description: "Read", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const entry = (sent.conversationState.history ?? []).find((h: KiroHistoryEntry) =>
+      h.assistantResponseMessage?.toolUses?.some((tu) => tu.toolUseId === "tc9"),
+    );
+    expect(entry).toBeDefined();
+    // The reasoning is gone from the text channel, the real text survives, and the
+    // structured tool use is untouched.
+    expect(entry?.assistantResponseMessage?.content).not.toContain("<thinking>");
+    expect(entry?.assistantResponseMessage?.content).not.toContain("deciding which file to read");
+    expect(entry?.assistantResponseMessage?.content).toContain("reading it now");
+    expect(entry?.assistantResponseMessage?.toolUses?.[0]?.name).toBe("read");
+    // Nothing anywhere in the request carries the markup.
+    expect(JSON.stringify(sent)).not.toContain("<thinking>");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("does not append a bare separator when merging an empty current turn into a previous assistant", async () => {
+    // A current turn carrying only a toolCall leaves `armContent === ""`. Merging
+    // that into the preceding assistant with an unconditional `\n\n` appends a
+    // dangling separator onto text the model actually produced.
+    //
+    // Reaching the merge branch needs the LAST history entry to be an assistant
+    // with no `userInputMessage`, so the fixture puts two assistant turns back to
+    // back with no tool result between them. A tool-result carrier in between ends
+    // history on a user entry and takes the push branch instead, which is what an
+    // earlier version of this test did — it passed against the unconditional
+    // separator and proved nothing.
+    const plainAssistant: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "earlier answer" }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "stop",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: "go", timestamp: ts },
+        plainAssistant,
+        makeToolCall("tcB"),
+        makeToolResult("tcB"),
+      ],
+      tools: [{ name: "read", description: "Read", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const merged = (sent.conversationState.history ?? []).find((h: KiroHistoryEntry) =>
+      h.assistantResponseMessage?.toolUses?.some((tu) => tu.toolUseId === "tcB"),
+    );
+    // The merge happened onto the real text, and it is byte-identical.
+    expect(merged?.assistantResponseMessage?.content).toBe("earlier answer");
+    for (const entry of sent.conversationState.history ?? []) {
+      const content = entry.assistantResponseMessage?.content;
+      if (typeof content !== "string") continue;
+      expect(content).not.toMatch(/\n\n$/);
+    }
+
+    vi.unstubAllGlobals();
+  });
+
+  it("repairs the live mismatched-pair wedge so it no longer earns a 400", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: "build it", timestamp: ts },
+        makeToolCall("A"),
+        { role: "user", content: "continue", timestamp: ts },
+        makeToolCall("B"),
+        {
+          role: "toolResult",
+          toolCallId: "A",
+          toolName: "read",
+          content: [{ type: "text", text: "REAL_OUTPUT_A" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "read", description: "Read", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const current = sent.conversationState.currentMessage.userInputMessage;
+    const conversation = [...(sent.conversationState.history ?? []), { userInputMessage: current }];
+
+    // The 400 is gone. `B` — the toolUse the backend named — is answered, and no
+    // result answering nothing is left on the wire. This is the whole point: the
+    // request is now one the backend accepts, so the session is not wedged.
+    expect(validateKiroToolStructure(conversation).valid).toBe(true);
+    expect(current.userInputMessageContext.toolResults).toHaveLength(1);
+    expect(current.userInputMessageContext.toolResults[0].toolUseId).toBe("B");
+    expect(current.userInputMessageContext.toolResults[0].status).toBe("error");
+    // `B` is answered rather than dropped, so the model still sees that its call
+    // was issued and did not complete.
+    const armToolUses = (sent.conversationState.history ?? []).flatMap(
+      (h: KiroHistoryEntry) => h.assistantResponseMessage?.toolUses ?? [],
+    );
+    expect(armToolUses.map((tu: { toolUseId: string }) => tu.toolUseId)).toContain("B");
+
+    // ---- What relocation preserves, and what it still costs. ----
+    //
+    // 1. `A`'s real output SURVIVES. `relocateDisplacedToolResults` moves the
+    //    displaced result back behind the assistant that issued it, before
+    //    anything positional runs, so `sanitizeHistory` no longer drops that
+    //    assistant and the result is no longer orphaned. This is a pure reorder:
+    //    nothing is fabricated and nothing is dropped.
+    expect(JSON.stringify(sent)).toContain("REAL_OUTPUT_A");
+    const historyResults = (sent.conversationState.history ?? []).flatMap(
+      (h: KiroHistoryEntry) => h.userInputMessage?.userInputMessageContext?.toolResults ?? [],
+    );
+    const resultA = historyResults.find((tr: { toolUseId: string }) => tr.toolUseId === "A");
+    expect(resultA).toBeDefined();
+    expect(resultA.status).toBe("success");
+    expect(resultA.content[0].text).toBe("REAL_OUTPUT_A");
+    // Paired with the assistant that actually issued it, which is what makes the
+    // request acceptable rather than merely present in the bytes.
+    const aIdx = (sent.conversationState.history ?? []).findIndex((h: KiroHistoryEntry) =>
+      h.assistantResponseMessage?.toolUses?.some((tu) => tu.toolUseId === "A"),
+    );
+    const afterA = (sent.conversationState.history ?? [])[aIdx + 1];
+    expect(afterA?.userInputMessage?.userInputMessageContext?.toolResults?.[0]?.toolUseId).toBe("A");
+    //
+    // 2. The real user interjection survives VERBATIM. Merging it into the
+    //    now-empty carrier must not prepend a separator: `"continue"`, never
+    //    `"\n\ncontinue"`. Fabricating whitespace onto a message the user wrote is
+    //    the same defect class as the carrier prose this change removes.
+    const interjection = (sent.conversationState.history ?? []).find((h: KiroHistoryEntry) =>
+      h.userInputMessage?.userInputMessageContext?.toolResults?.some((tr) => tr.toolUseId === "A"),
+    );
+    expect(interjection?.userInputMessage?.content).toBe("continue");
+    //
+    // 3. Wire chronology shifts, and that is the accepted cost. The interjection
+    //    was said BEFORE `A`'s result arrived, but appears after it on the wire,
+    //    because relocation moves the result and not the user turn. A fidelity
+    //    loss, not a fabrication, and strictly less lossy than discarding real
+    //    tool output the model is waiting on.
+    expect(aIdx).toBeLessThan(
+      (sent.conversationState.history ?? []).findIndex(
+        (h: KiroHistoryEntry) => h.userInputMessage?.content === "continue",
+      ),
+    );
+    //
+    // 4. `B` is still answered synthetically. Relocation makes `B` the trailing
+    //    turn with nothing after it, so repair supplies its missing result — the
+    //    same synthesis emitted before relocation existed. Relocation changes
+    //    which output is PRESERVED, not how much is fabricated.
+    //
+    // 5. All seven rules now pass for this shape — a better outcome than
+    //    relocation was expected to deliver. Before relocation the interjection
+    //    left two consecutive user entries and `ALTERNATING_MESSAGES` survived as
+    //    an unrepairable residual. Relocation moves `A`'s result to sit directly
+    //    behind `A`, and the interjection then merges INTO that carrier entry
+    //    rather than following it, so one user entry now carries both `A`'s real
+    //    result and the user's verbatim text. Alternation holds as a consequence.
+    //
+    //    This is asserted rather than assumed: it is the reason the residual list
+    //    is empty, and if a future change reintroduces a separate interjection
+    //    entry this goes red rather than silently regressing to a residual.
+    const residual = validateKiroConversation(conversation).errors;
+    expect(residual).toEqual([]);
+    const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(warned).not.toContain("outbound history");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("repairs an outbound tool structure that violates an invariant", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const assistantWithTool: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tcA", name: "calc", arguments: {} }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        ...settledTurn(),
+        assistantWithTool,
+        // Answers `tcZ`, which no preceding toolUse issued.
+        {
+          role: "toolResult",
+          toolCallId: "tcZ",
+          toolName: "calc",
+          content: [{ type: "text", text: "orphan" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "calc", description: "Calculate", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    // Repaired, not merely reported: the orphan `tcZ` result is stripped and
+    // `tcA` — which nothing answered — gets a synthetic failure result, so the
+    // conversation that reaches the wire satisfies all seven rules.
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const conversation = [
+      ...(sent.conversationState.history ?? []),
+      { userInputMessage: sent.conversationState.currentMessage.userInputMessage },
+    ];
+    expect(validateKiroConversation(conversation).valid).toBe(true);
+    const sentResults = sent.conversationState.currentMessage.userInputMessage.userInputMessageContext?.toolResults;
+    expect(sentResults?.map((tr: { toolUseId: string }) => tr.toolUseId)).toEqual(["tcA"]);
+    expect(sentResults?.[0].status).toBe("error");
+    // Nothing survived repair, so nothing is warned about.
+    const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(warned).not.toContain("outbound history");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("stays silent on a well-formed tool turn", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const assistantWithTool: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tcA", name: "calc", arguments: {} }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        ...settledTurn(),
+        assistantWithTool,
+        {
+          role: "toolResult",
+          toolCallId: "tcA",
+          toolName: "calc",
+          content: [{ type: "text", text: "7" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "calc", description: "Calculate", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(warned).not.toContain("outbound history");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  // Probed 2026-08-11 before this test existed: this context reached the wire as
+  // `currentMessage.userInputMessage` with populated `toolResults`, no `history`
+  // at all, and no `toolUse` anywhere — the exact shape the backend rejects as
+  // `TOOL_USE_RESULT_MISMATCH` — while the invariant check stayed silent, because
+  // the pairwise walk only inspects a carrier that follows an assistant entry.
+  //
+  // It is now repaired rather than warned about. This is also the one shape that
+  // repair COLLAPSES: the whole conversation is a single bare carrier, so step 1
+  // finds no valid opening entry and consumes it. `stream.ts` handles that
+  // explicitly — strip the results that answer nothing, keep the tool catalog,
+  // and fall back to the neutral prompt.
+  //
+  // MUTATION PROBE: restore `wireUimc = repairedCurrent?.userInputMessageContext ?? uimc`
+  // and this goes red — the fallback puts the stripped orphan straight back.
+  it("repairs a tool-result carrier that has no toolUse anywhere", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        // No assistant turn ever issued `tcZ`. `sanitizeHistory` cannot repair
+        // this one: the carrier is the current message, not a history entry.
+        {
+          role: "toolResult",
+          toolCallId: "tcZ",
+          toolName: "calc",
+          content: [{ type: "text", text: "orphan" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "calc", description: "Calculate", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(
+      streamKiro(makeModel({ kiroProfileArn: "arn:aws:codewhisperer:us-east-1:0:profile/X" }), context, {
+        apiKey: "tok",
+      }),
+    );
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const currentMsg = sent.conversationState.currentMessage.userInputMessage;
+    // The orphan is gone — sending it is what earns the 400.
+    expect(currentMsg.userInputMessageContext?.toolResults ?? []).toHaveLength(0);
+    // The tool catalog survives, and the turn still has a payload.
+    expect(currentMsg.userInputMessageContext?.tools).toBeDefined();
+    expect(currentMsg.content).toBe(EMPTY_CONTENT_PLACEHOLDER);
+    expect(sent.conversationState.history ?? []).toHaveLength(0);
+    const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(warned).not.toContain("outbound history");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  // Newer Pi-compatible hosts convert application-specific messages to the
+  // canonical `developer` role before provider dispatch. Kiro has no distinct
+  // developer wire role, so those messages must retain their content as user
+  // input rather than degrade to EMPTY_CONTENT_PLACEHOLDER.
+  it("preserves a current developer message as Kiro user input", async () => {
     const settledAssistant: AssistantMessage = {
       role: "assistant",
       content: [{ type: "text", text: "Done." }],
@@ -1418,9 +2246,48 @@ describe("Feature 9: Streaming Integration", () => {
     const events = await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
 
     const currentMsg = JSON.parse(mockFetch.mock.calls[0][1].body).conversationState.currentMessage.userInputMessage;
-    expect(currentMsg.content).not.toBe("");
+    expect(currentMsg.content).toBe("<system-reminder>2 incomplete todos</system-reminder>");
     expect(events.some((event) => event.type === "done")).toBe(true);
     expect(events.some((event) => event.type === "error")).toBe(false);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("preserves a historical developer message in Kiro history", async () => {
+    const advisory = {
+      role: "developer",
+      content: [{ type: "text", text: '<advisory severity="concern">STOP_AND_REPORT</advisory>' }],
+      attribution: "agent",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: "Investigate", timestamp: ts },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Working." }],
+          api: "kiro-api",
+          provider: "kiro",
+          model: "claude-sonnet-4-5",
+          usage: zeroUsage,
+          stopReason: "stop",
+          timestamp: ts,
+        },
+        advisory as unknown as Context["messages"][number],
+        { role: "user", content: "Continue", timestamp: ts + 1 },
+      ],
+      tools: [],
+    };
+    const mockFetch = mockFetchOk('{"content":"Continuing."}{"contextUsagePercentage":4}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const historicalAdvisory = sent.conversationState.history.at(-1).userInputMessage;
+    expect(historicalAdvisory.content).toBe('<advisory severity="concern">STOP_AND_REPORT</advisory>');
+    expect(sent.conversationState.currentMessage.userInputMessage.content).toBe("Continue");
 
     vi.unstubAllGlobals();
   });
@@ -1619,7 +2486,7 @@ describe("Feature 9: Streaming Integration", () => {
       ok: false,
       status: 429,
       statusText: "Too Many Requests",
-      text: () => Promise.resolve("MONTHLY_REQUEST_COUNT exceeded"),
+      text: () => Promise.resolve('{"message":"Monthly quota exhausted","reason":"MONTHLY_REQUEST_COUNT"}'),
     });
     vi.stubGlobal("fetch", mockFetch);
 
@@ -2063,6 +2930,137 @@ describe("Feature 9: Streaming Integration", () => {
   });
 
   // =========================================================================
+  // Response-header timeout
+  // =========================================================================
+
+  it("times out a fetch that never returns response headers", async () => {
+    vi.useFakeTimers();
+    const originalTimeout = retryConfig.requestHeaderTimeoutMs;
+    retryConfig.requestHeaderTimeoutMs = 10;
+    const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const eventsPromise = collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      await vi.advanceTimersByTimeAsync(7_100);
+      const events = await eventsPromise;
+
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      const error = events.find((event) => event.type === "error");
+      expect(error?.type === "error" && error.error.errorMessage).toBe(
+        "Kiro API error: response headers timeout after max retries",
+      );
+    } finally {
+      retryConfig.requestHeaderTimeoutMs = originalTimeout;
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("preserves caller cancellation during the response-header wait", async () => {
+    const controller = new AbortController();
+    const removeListenerSpy = vi.spyOn(controller.signal, "removeEventListener");
+    let notifyFetchStarted: (() => void) | undefined;
+    const fetchStarted = new Promise<void>((resolve) => {
+      notifyFetchStarted = resolve;
+    });
+    const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+      notifyFetchStarted?.();
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const eventsPromise = collect(
+        streamKiro(makeModel(), makeContext(), { apiKey: "tok", signal: controller.signal }),
+      );
+      await fetchStarted;
+      controller.abort(new DOMException("cancelled by caller", "AbortError"));
+      const events = await eventsPromise;
+
+      expect(fetchMock).toHaveBeenCalledOnce();
+      const error = events.find((event) => event.type === "error");
+      expect(error?.type === "error" && error.error.stopReason).toBe("aborted");
+      expect(error?.type === "error" && error.error.errorMessage).toContain("cancelled by caller");
+      expect(error?.type === "error" && error.error.errorMessage).not.toContain("response headers timeout");
+      expect(removeListenerSpy).toHaveBeenCalledWith("abort", expect.any(Function));
+    } finally {
+      removeListenerSpy.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("clears the response-header timer and caller listener after headers arrive", async () => {
+    vi.useFakeTimers();
+    const originalTimeout = retryConfig.requestHeaderTimeoutMs;
+    retryConfig.requestHeaderTimeoutMs = 10;
+    const controller = new AbortController();
+    const removeListenerSpy = vi.spyOn(controller.signal, "removeEventListener");
+    const fetchMock = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":5}');
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const events = await collect(
+        streamKiro(makeModel(), makeContext(), { apiKey: "tok", signal: controller.signal }),
+      );
+      const requestInit = fetchMock.mock.calls[0]?.[1] as RequestInit;
+      const responseHeaderSignal = requestInit.signal as AbortSignal;
+
+      expect(events.find((event) => event.type === "done")).toBeDefined();
+      expect(responseHeaderSignal.aborted).toBe(false);
+      expect(removeListenerSpy).toHaveBeenCalledWith("abort", expect.any(Function));
+      await vi.advanceTimersByTimeAsync(11);
+      expect(responseHeaderSignal.aborted).toBe(false);
+    } finally {
+      retryConfig.requestHeaderTimeoutMs = originalTimeout;
+      removeListenerSpy.mockRestore();
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("retries a response-header timeout and succeeds", async () => {
+    vi.useFakeTimers();
+    const originalTimeout = retryConfig.requestHeaderTimeoutMs;
+    retryConfig.requestHeaderTimeoutMs = 10;
+    const successfulFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":5}');
+    const requestSignals: AbortSignal[] = [];
+    const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+      requestSignals.push(init?.signal as AbortSignal);
+      if (requestSignals.length === 1) {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+        });
+      }
+      return successfulFetch();
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const eventsPromise = collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      await vi.advanceTimersByTimeAsync(1_010);
+      const events = await eventsPromise;
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(requestSignals[0]?.reason).toMatchObject({ name: "TimeoutError" });
+      expect(requestSignals[1]?.aborted).toBe(false);
+      expect(events.find((event) => event.type === "done")).toBeDefined();
+      await vi.advanceTimersByTimeAsync(11);
+      expect(requestSignals[1]?.aborted).toBe(false);
+    } finally {
+      retryConfig.requestHeaderTimeoutMs = originalTimeout;
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  // =========================================================================
   // First-token timeout (Task 1.2)
   // =========================================================================
 
@@ -2177,7 +3175,136 @@ describe("Feature 9: Streaming Integration", () => {
   // Provider-level HTTP error handling
   // =========================================================================
 
-  it("propagates 429 immediately so pi-coding-agent can own outer retries", async () => {
+  it.each([
+    ["retry-after-ms milliseconds", { "retry-after-ms": "25" }, 25],
+    ["retry-after seconds", { "retry-after": "0.025" }, 25],
+    ["retry-after HTTP date", { "retry-after": "Sat, 29 Aug 2026 00:00:05 GMT" }, 5000],
+    ["x-ratelimit-reset-after seconds", { "x-ratelimit-reset-after": "0.025" }, 25],
+  ])("honors %s for exact USER_REQUEST_RATE_EXCEEDED and then succeeds", async (_name, headers, delayMs) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-29T00:00:00Z"));
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(makeRequestRateResponse(headers))
+      .mockResolvedValueOnce(makeOkResponse('{"content":"ok"}{"contextUsagePercentage":5}'));
+    vi.stubGlobal("fetch", mockFetch);
+
+    try {
+      const eventsPromise = collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mockFetch).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(delayMs - 1);
+      expect(mockFetch).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(1);
+      const events = await eventsPromise;
+
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(events.find((event) => event.type === "done")).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it.each([
+    ["an absent hint", undefined],
+    [
+      "malformed, non-finite, and negative hints",
+      { "retry-after-ms": "not-a-number", "retry-after": "-1", "x-ratelimit-reset-after": "Infinity" },
+    ],
+  ])("uses the 10-second request-window fallback for %s", async (_name, headers) => {
+    vi.useFakeTimers();
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(makeRequestRateResponse(headers))
+      .mockResolvedValueOnce(makeOkResponse('{"content":"ok"}{"contextUsagePercentage":5}'));
+    vi.stubGlobal("fetch", mockFetch);
+
+    try {
+      const eventsPromise = collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(mockFetch).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(1);
+      const events = await eventsPromise;
+
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(events.find((event) => event.type === "done")).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("caps a longer server request-window hint at 10 seconds", async () => {
+    vi.useFakeTimers();
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(makeRequestRateResponse({ "retry-after-ms": "15000" }))
+      .mockResolvedValueOnce(makeOkResponse('{"content":"ok"}{"contextUsagePercentage":5}'));
+    vi.stubGlobal("fetch", mockFetch);
+
+    try {
+      const eventsPromise = collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(mockFetch).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(1);
+      const events = await eventsPromise;
+
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(events.find((event) => event.type === "done")).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("preserves caller cancellation during request-window backoff", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const mockFetch = vi.fn().mockResolvedValue(makeRequestRateResponse());
+    vi.stubGlobal("fetch", mockFetch);
+
+    try {
+      const eventsPromise = collect(
+        streamKiro(makeModel(), makeContext(), { apiKey: "tok", signal: controller.signal }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      controller.abort(new DOMException("cancelled by caller", "AbortError"));
+      const events = await eventsPromise;
+
+      expect(mockFetch).toHaveBeenCalledOnce();
+      const error = events.find((event) => event.type === "error");
+      expect(error?.type === "error" && error.error.stopReason).toBe("aborted");
+      expect(error?.type === "error" && error.error.errorMessage).toContain("cancelled by caller");
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("exhausts the shared provider retry budget without starting a new Pi retry episode", async () => {
+    vi.useFakeTimers();
+    const mockFetch = vi.fn().mockResolvedValue(makeRequestRateResponse());
+    vi.stubGlobal("fetch", mockFetch);
+
+    try {
+      const eventsPromise = collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      await vi.advanceTimersByTimeAsync(30_000);
+      const events = await eventsPromise;
+
+      expect(mockFetch).toHaveBeenCalledTimes(4);
+      const error = events.find((event) => event.type === "error");
+      expect(error?.type === "error" && error.error.errorMessage).toBe(
+        "Kiro API error: request window retry budget exhausted (USER_REQUEST_RATE_EXCEEDED)",
+      );
+      expect(error?.type === "error" && isRetryableAssistantError(error.error)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("propagates an unknown 429 immediately so pi-coding-agent can own outer retries", async () => {
     const mockFetch = vi
       .fn()
       .mockResolvedValueOnce({
@@ -2488,6 +3615,9 @@ describe("Feature 9: Streaming Integration", () => {
   });
 
   it("does not retry repeated 429 responses inside the provider", async () => {
+    vi.useFakeTimers();
+    const originalTimeout = retryConfig.requestHeaderTimeoutMs;
+    retryConfig.requestHeaderTimeoutMs = 10;
     const mockFetch = vi.fn().mockResolvedValue({
       ok: false,
       status: 429,
@@ -2496,15 +3626,24 @@ describe("Feature 9: Streaming Integration", () => {
     });
     vi.stubGlobal("fetch", mockFetch);
 
-    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
-    const events = await collect(stream);
+    try {
+      const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+      const events = await collect(stream);
+      const requestInit = mockFetch.mock.calls[0]?.[1] as RequestInit;
+      const responseHeaderSignal = requestInit.signal as AbortSignal;
 
-    expect(mockFetch).toHaveBeenCalledTimes(1);
-    const error = events.find((e) => e.type === "error");
-    expect(error).toBeDefined();
-    expect(error?.type === "error" && error.error.stopReason).toBe("error");
-
-    vi.unstubAllGlobals();
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const error = events.find((e) => e.type === "error");
+      expect(error).toBeDefined();
+      expect(error?.type === "error" && error.error.stopReason).toBe("error");
+      await vi.advanceTimersByTimeAsync(11);
+      expect(responseHeaderSignal.aborted).toBe(false);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    } finally {
+      retryConfig.requestHeaderTimeoutMs = originalTimeout;
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
   }, 15000);
 
   it("aborts promptly during 403 retry backoff delay", async () => {
@@ -2588,10 +3727,12 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
-  it("prefers usage event values over tiktoken when available", async () => {
+  it("prefers metadataEvent token usage over tiktoken when available", async () => {
     const mockFetch = mockFetchChunked([
       '{"content":"Hello"}',
-      '{"usage":{"inputTokens":500,"outputTokens":200}}',
+      // MetadataEvent shape from ChatResponseStream: token counts live under
+      // tokenUsage.uncachedInputTokens/outputTokens, not a top-level `usage`.
+      '{"tokenUsage":{"uncachedInputTokens":500,"outputTokens":200,"totalTokens":700}}',
       '{"contextUsagePercentage":10}',
     ]);
     vi.stubGlobal("fetch", mockFetch);
@@ -2611,6 +3752,656 @@ describe("Feature 9: Streaming Integration", () => {
     // contextPercent should still reflect the API's contextUsagePercentage,
     // not be derived from the (overwritten) input token count
     expect((msg.usage as unknown as Record<string, unknown>).contextPercent).toBe(10);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("records cacheRead/cacheWrite so a cached turn is not priced as uncached input", async () => {
+    // TokenUsage.uncachedInputTokens excludes cache reads. Taking `input` from
+    // it while leaving cacheRead at 0 would report ~200 input tokens for a turn
+    // that actually read 50k cached tokens, and price it accordingly.
+    const mockFetch = mockFetchChunked([
+      '{"content":"Hello"}',
+      '{"tokenUsage":{"uncachedInputTokens":200,"outputTokens":50,"totalTokens":50250,"cacheReadInputTokens":50000,"cacheWriteInputTokens":0}}',
+      '{"contextUsagePercentage":5}',
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg).toBeDefined();
+    if (!msg) throw new Error("Expected a completed assistant message");
+
+    expect(msg.usage.input).toBe(200);
+    expect(msg.usage.cacheRead).toBe(50000);
+    expect(msg.usage.cacheWrite).toBe(0);
+    // input + cacheRead + cacheWrite + output, matching the wire totalTokens.
+    expect(msg.usage.totalTokens).toBe(50250);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps the wire totalTokens when the service omits an optional cache count", async () => {
+    // TokenUsage.totalTokens is required on the wire; cacheReadInputTokens and
+    // cacheWriteInputTokens are optional. Recomputing the total from components
+    // would report 250 for a turn the service says cost 50250 context tokens,
+    // and calculateContextTokens drives the context gauge from that total.
+    const mockFetch = mockFetchChunked([
+      '{"content":"Hello"}',
+      '{"tokenUsage":{"uncachedInputTokens":200,"outputTokens":50,"totalTokens":50250}}',
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg).toBeDefined();
+    if (!msg) throw new Error("Expected a completed assistant message");
+
+    expect(msg.usage.input).toBe(200);
+    expect(msg.usage.cacheRead).toBe(0);
+    expect(msg.usage.totalTokens).toBe(50250);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps metadataEvent token counts when a meteringEvent credit frame follows", async () => {
+    // MeteringEvent.usage is a NUMBER of credits. It is the only top-level
+    // `usage` the service emits, and the pre-routing field ladder consumed it as
+    // a token object, reading .inputTokens/.outputTokens off a number. Framed
+    // with an explicit `:event-type` because a units-only or count-only metering
+    // payload cannot be reliably inferred from its shape.
+    const frames = concatMessages(
+      encodeEventMessage({ content: "Hello" }),
+      encodeEventMessage(
+        { tokenUsage: { uncachedInputTokens: 500, outputTokens: 200, totalTokens: 700 } },
+        "metadataEvent",
+      ),
+      encodeEventMessage({ usage: 3, unit: "credit", unitPlural: "credits" }, "meteringEvent"),
+    );
+    const mockFetch = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({ done: false, value: frames })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          releaseLock: () => {},
+        }),
+        cancel: async () => {},
+      },
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg).toBeDefined();
+    if (!msg) throw new Error("Expected a completed assistant message");
+
+    // The credit count must not land in, or erase, token accounting.
+    expect(msg.usage.input).toBe(500);
+    expect(msg.usage.output).toBe(200);
+    expect(msg.usage.totalTokens).toBe(700);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("merges metadataEvent frames so a later stopReason frame cannot erase token counts", async () => {
+    // Every MetadataEvent field is optional; tokenUsage and stopReason may
+    // arrive in separate frames.
+    const mockFetch = mockFetchChunked([
+      '{"content":"Hello"}',
+      '{"tokenUsage":{"uncachedInputTokens":500,"outputTokens":200,"totalTokens":700}}',
+      '{"stopReason":"END_TURN"}',
+      '{"contextUsagePercentage":10}',
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg).toBeDefined();
+    if (!msg) throw new Error("Expected a completed assistant message");
+
+    expect(msg.usage.input).toBe(500);
+    expect(msg.usage.output).toBe(200);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("surfaces a mid-stream throttlingError frame and retries", async () => {
+    // throttlingError / validationError / serviceUnavailableError are distinct
+    // ChatResponseStream members targeting @error shapes, so the service frames
+    // them as `:message-type: exception`. Before key routing they reached the
+    // caller only as an opaque JSON blob with the modeled class discarded.
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(async () => {
+      callCount++;
+      if (callCount === 1) {
+        return {
+          ok: true,
+          body: {
+            getReader: () => ({
+              read: vi
+                .fn()
+                .mockResolvedValueOnce({
+                  done: false,
+                  value: concatMessages(
+                    encodeEventMessage({ content: "partial" }),
+                    encodeExceptionMessage("throttlingError", {
+                      message: "Too many requests",
+                      reason: "INSUFFICIENT_MODEL_CAPACITY",
+                      retryAfterMilliseconds: 10,
+                    }),
+                  ),
+                })
+                .mockResolvedValueOnce({ done: true, value: undefined }),
+              cancel: vi.fn().mockResolvedValue(undefined),
+              releaseLock: () => {},
+            }),
+          },
+        };
+      }
+      return {
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: vi
+              .fn()
+              .mockResolvedValueOnce({
+                done: false,
+                value: encodeBody('{"content":"recovered"}{"contextUsagePercentage":5}'),
+              })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            cancel: vi.fn().mockResolvedValue(undefined),
+            releaseLock: () => {},
+          }),
+        },
+      };
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    const done = events.find((e) => e.type === "done");
+    expect(done?.type === "done" && (done.message.content[0] as TextContent).text).toBe("recovered");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("reports the modeled exception class when a typed error frame outlives every retry", async () => {
+    // Exception-framed member: the marshaller throws whatever the deserializer
+    // returns for the `:exception-type` key, so the class name only survives if
+    // that callback recognizes the member. Returning the bare payload would
+    // surface `{"message":"capacity exhausted"}` with no class at all.
+    const mockFetch = vi.fn().mockImplementation(async () => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({
+              done: false,
+              value: encodeExceptionMessage("serviceUnavailableError", { message: "capacity exhausted" }),
+            })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          cancel: vi.fn().mockResolvedValue(undefined),
+          releaseLock: () => {},
+        }),
+      },
+    }));
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const error = events.find((e) => e.type === "error");
+    expect(error?.type === "error" && error.error.errorMessage).toContain("ServiceUnavailableException");
+    expect(error?.type === "error" && error.error.errorMessage).toContain("capacity exhausted");
+
+    vi.unstubAllGlobals();
+  }, 30000);
+
+  it("keeps the exception-type name when the member is not one this client models", async () => {
+    // Smithy's own raw-body fallback only fires when the deserializer returns a
+    // `$unknown` property, which this one never does, so an unmodeled member
+    // would otherwise be thrown as the bare parsed object and reach the caller
+    // as `{"message":"..."}` with the member name gone — the same class loss
+    // this card removes for the four modeled members.
+    const mockFetch = vi.fn().mockImplementation(async () => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({
+              done: false,
+              value: encodeRawExceptionMessage("quotaExceededError", { message: "monthly quota gone" }),
+            })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          cancel: vi.fn().mockResolvedValue(undefined),
+          releaseLock: () => {},
+        }),
+      },
+    }));
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const error = events.find((e) => e.type === "error");
+    expect(error?.type === "error" && error.error.errorMessage).toContain("quotaExceededError");
+    expect(error?.type === "error" && error.error.errorMessage).toContain("monthly quota gone");
+
+    vi.unstubAllGlobals();
+  }, 30000);
+
+  it("classifies an exception frame that names the exception class instead of the union member", async () => {
+    // `:exception-type` is chosen by the service and is not guaranteed to be the
+    // union member name: the hand-written event-stream bridge in the generated
+    // client for this same service accepts `throttlingError` OR
+    // `ThrottlingException` for every one of the four members.
+    //
+    // This is an end-to-end pin that a class-name token survives Smithy's
+    // exception framing intact. The classification itself (`kind: "throttling"`
+    // vs `"unknown"`) is asserted in test/event-parser.test.ts, because
+    // `KiroErrorData.kind` is not yet surfaced on the emitted AssistantMessage —
+    // the diagnostics card owns that.
+    const mockFetch = vi.fn().mockImplementation(async () => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({
+              done: false,
+              value: encodeRawExceptionMessage("ServiceUnavailableException", { message: "capacity exhausted" }),
+            })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          cancel: vi.fn().mockResolvedValue(undefined),
+          releaseLock: () => {},
+        }),
+      },
+    }));
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const error = events.find((e) => e.type === "error");
+    expect(error?.type === "error" && error.error.errorMessage).toContain("ServiceUnavailableException");
+    expect(error?.type === "error" && error.error.errorMessage).toContain("capacity exhausted");
+
+    vi.unstubAllGlobals();
+  }, 30000);
+
+  it("keeps the modeled class when an exception frame body is not parseable JSON", async () => {
+    // The class is a header, so it survives a body this client cannot read.
+    // Parsing before the exception branch threw a SyntaxError out of the
+    // deserializer, and the caller reported "Unexpected end of JSON input" with
+    // the modeled class gone — the same class loss, reintroduced by a truncated
+    // or non-JSON body.
+    const mockFetch = vi.fn().mockImplementation(async () => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({
+              done: false,
+              value: encodeExceptionMessageWithRawBody("throttlingError", ""),
+            })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          cancel: vi.fn().mockResolvedValue(undefined),
+          releaseLock: () => {},
+        }),
+      },
+    }));
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const error = events.find((e) => e.type === "error");
+    expect(error?.type === "error" && error.error.errorMessage).toContain("ThrottlingException");
+    expect(error?.type === "error" && error.error.errorMessage).not.toContain("JSON");
+
+    vi.unstubAllGlobals();
+  }, 30000);
+
+  it("does not inherit the failed attempt's cache counts when retrying", async () => {
+    // `usageEvent` is declared inside the retry loop, and the cache writes are
+    // post-loop, so an aborted attempt must contribute nothing to billing.
+    // cacheRead is priced as its own line in calculateCost, so inheriting a
+    // prior attempt's value would over-bill a turn that never read that cache.
+    //
+    // Priced deliberately: `makeModel()` defaults every rate to 0, so a
+    // `cost.*` assertion against the default model passes no matter what leaked
+    // across the retry boundary. Real per-million rates make these assertions
+    // able to fail at all. What actually holds this invariant is `usageEvent`'s
+    // loop scope, not the attempt-boundary reset — dropping the cache lines
+    // from `resetAttemptUsage` leaves this test green, because the aborted
+    // attempt errors before the post-stream cache writes ever run. The
+    // terminal-failure test below is what pins the reset itself.
+    const priced = makeModel({ cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } });
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(async () => {
+      callCount++;
+      if (callCount === 1) {
+        return {
+          ok: true,
+          body: {
+            getReader: () => ({
+              read: vi
+                .fn()
+                .mockResolvedValueOnce({
+                  done: false,
+                  value: concatMessages(
+                    encodeEventMessage({
+                      tokenUsage: {
+                        uncachedInputTokens: 999,
+                        outputTokens: 111,
+                        totalTokens: 41110,
+                        cacheReadInputTokens: 40000,
+                        cacheWriteInputTokens: 7,
+                      },
+                    }),
+                    encodeExceptionMessage("throttlingError", { message: "throttled" }),
+                  ),
+                })
+                .mockResolvedValueOnce({ done: true, value: undefined }),
+              cancel: vi.fn().mockResolvedValue(undefined),
+              releaseLock: () => {},
+            }),
+          },
+        };
+      }
+      // Retry succeeds and reports NO metadataEvent at all.
+      return {
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: vi
+              .fn()
+              .mockResolvedValueOnce({
+                done: false,
+                value: encodeBody('{"content":"clean"}{"contextUsagePercentage":5}'),
+              })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            cancel: vi.fn().mockResolvedValue(undefined),
+            releaseLock: () => {},
+          }),
+        },
+      };
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(priced, makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg).toBeDefined();
+    if (!msg) throw new Error("Expected a completed assistant message");
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect((msg.content[0] as TextContent).text).toBe("clean");
+    // The abandoned attempt's counts must not appear anywhere in billing.
+    expect(msg.usage.cacheRead).toBe(0);
+    expect(msg.usage.cacheWrite).toBe(0);
+    expect(msg.usage.cost.cacheRead).toBe(0);
+    expect(msg.usage.cost.cacheWrite).toBe(0);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("reports zero tokens and zero cost when a priced attempt is replaced by a terminally failing retry", async () => {
+    // The post-stream usage writes and `calculateCost` both run BEFORE the
+    // empty-response retry check, so a degenerate attempt that reported
+    // metadataEvent counts leaves a real priced charge on `output.usage.cost`.
+    // `output` outlives the retry loop. If the attempt-boundary reset cleared
+    // only the token counts and left `cost` alone, the terminal error would be
+    // emitted with totalTokens 0 and a stale non-zero charge — an invented bill
+    // for a turn that produced nothing.
+    const priced = makeModel({ cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } });
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(async () => {
+      callCount++;
+      if (callCount === 1) {
+        // Degenerate but expensive: large counts, no text, no tool calls. Gets
+        // priced, then triggers the empty-response retry.
+        return {
+          ok: true,
+          body: {
+            getReader: () => ({
+              read: vi
+                .fn()
+                .mockResolvedValueOnce({
+                  done: false,
+                  value: encodeEventMessage({
+                    tokenUsage: {
+                      uncachedInputTokens: 90000,
+                      outputTokens: 4000,
+                      totalTokens: 194000,
+                      cacheReadInputTokens: 100000,
+                      cacheWriteInputTokens: 0,
+                    },
+                  }),
+                })
+                .mockResolvedValueOnce({ done: true, value: undefined }),
+              cancel: vi.fn().mockResolvedValue(undefined),
+              releaseLock: () => {},
+            }),
+          },
+        };
+      }
+      // Every later attempt fails with a modeled exception frame, so the retry
+      // budget is exhausted and the turn ends in a terminal error.
+      return {
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: vi
+              .fn()
+              .mockResolvedValueOnce({
+                done: false,
+                value: encodeExceptionMessage("serviceUnavailableError", { message: "unavailable" }),
+              })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            cancel: vi.fn().mockResolvedValue(undefined),
+            releaseLock: () => {},
+          }),
+        },
+      };
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(priced, makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const error = events.find((e) => e.type === "error");
+    expect(error?.type).toBe("error");
+    if (error?.type !== "error") throw new Error("Expected a terminal error event");
+    expect(error.error.errorMessage).toContain("ServiceUnavailableException");
+
+    const usage = error.error.usage;
+    expect(usage.input).toBe(0);
+    expect(usage.output).toBe(0);
+    expect(usage.cacheRead).toBe(0);
+    expect(usage.cacheWrite).toBe(0);
+    expect(usage.totalTokens).toBe(0);
+    // The charge the abandoned attempt earned must be gone with its counts.
+    expect(usage.cost.input).toBe(0);
+    expect(usage.cost.output).toBe(0);
+    expect(usage.cost.cacheRead).toBe(0);
+    expect(usage.cost.cacheWrite).toBe(0);
+    expect(usage.cost.total).toBe(0);
+
+    vi.unstubAllGlobals();
+  }, 30000);
+
+  it("does not inherit the failed attempt's contextUsage input when retrying", async () => {
+    // `contextUsageEvent` writes `output.usage.input` and `contextPercent`
+    // straight onto the shared message, which outlives the retry loop. Routing
+    // typed error members made a mid-stream throttle a live retry trigger, so
+    // without an attempt-boundary reset the retried turn is billed for the
+    // abandoned attempt's input and reports its context gauge.
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(async () => {
+      callCount++;
+      if (callCount === 1) {
+        return {
+          ok: true,
+          body: {
+            getReader: () => ({
+              read: vi
+                .fn()
+                .mockResolvedValueOnce({
+                  done: false,
+                  value: concatMessages(
+                    encodeEventMessage({ content: "partial" }),
+                    encodeEventMessage({ contextUsagePercentage: 90 }),
+                    encodeExceptionMessage("throttlingError", { message: "slow down" }),
+                  ),
+                })
+                .mockResolvedValueOnce({ done: true, value: undefined }),
+              cancel: vi.fn().mockResolvedValue(undefined),
+              releaseLock: () => {},
+            }),
+          },
+        };
+      }
+      // Retry succeeds reporting NO contextUsage and NO metadataEvent.
+      return {
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: vi
+              .fn()
+              .mockResolvedValueOnce({ done: false, value: encodeEventMessage({ content: "clean" }) })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            cancel: vi.fn().mockResolvedValue(undefined),
+            releaseLock: () => {},
+          }),
+        },
+      };
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg).toBeDefined();
+    if (!msg) throw new Error("Expected a completed assistant message");
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect((msg.content[0] as TextContent).text).toBe("clean");
+    // 90% of a 200000-token window is 180000 input tokens the retried turn
+    // never used.
+    expect(msg.usage.input).toBe(0);
+    expect((msg.usage as unknown as Record<string, unknown>).contextPercent).toBeUndefined();
+
+    vi.unstubAllGlobals();
+  });
+
+  it("does not inherit the failed attempt's token counts across an empty-response retry", async () => {
+    // The post-stream usage writes run BEFORE the empty-response retry check, so
+    // this path leaks differently from the mid-stream error path above. Routing
+    // metadataEvent made it reachable: previously the frame was dropped, so
+    // there were no wire counts to inherit.
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(async () => {
+      callCount++;
+      if (callCount === 1) {
+        // A metadataEvent with large counts and no text or tool calls at all.
+        return {
+          ok: true,
+          body: {
+            getReader: () => ({
+              read: vi
+                .fn()
+                .mockResolvedValueOnce({
+                  done: false,
+                  value: encodeEventMessage({
+                    tokenUsage: {
+                      uncachedInputTokens: 999,
+                      outputTokens: 111,
+                      totalTokens: 41110,
+                      cacheReadInputTokens: 40000,
+                      cacheWriteInputTokens: 7,
+                    },
+                  }),
+                })
+                .mockResolvedValueOnce({ done: true, value: undefined }),
+              cancel: vi.fn().mockResolvedValue(undefined),
+              releaseLock: () => {},
+            }),
+          },
+        };
+      }
+      return {
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: vi
+              .fn()
+              .mockResolvedValueOnce({ done: false, value: encodeEventMessage({ content: "clean" }) })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            cancel: vi.fn().mockResolvedValue(undefined),
+            releaseLock: () => {},
+          }),
+        },
+      };
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg).toBeDefined();
+    if (!msg) throw new Error("Expected a completed assistant message");
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect((msg.content[0] as TextContent).text).toBe("clean");
+    expect(msg.usage.input).toBe(0);
+    expect(msg.usage.cacheRead).toBe(0);
+    expect(msg.usage.cacheWrite).toBe(0);
+    // Output falls back to counting the recovered text, never the 111 reported
+    // by the abandoned attempt.
+    expect(msg.usage.output).toBeLessThan(111);
+    expect(msg.usage.totalTokens).toBe(msg.usage.output);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("falls back to summing components when a non-conforming frame omits totalTokens", async () => {
+    // TokenUsage.totalTokens is required on the wire, so this branch only guards
+    // a non-conforming server. The sum must match how the service itself defines
+    // the total: uncachedInput + cacheRead + cacheWrite + output.
+    const mockFetch = mockFetchChunked([
+      '{"content":"Hello"}',
+      '{"tokenUsage":{"uncachedInputTokens":200,"outputTokens":50,"cacheReadInputTokens":50000,"cacheWriteInputTokens":0}}',
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg).toBeDefined();
+    if (!msg) throw new Error("Expected a completed assistant message");
+
+    // Same components as the wire-total test above, which reports 50250.
+    expect(msg.usage.totalTokens).toBe(50250);
 
     vi.unstubAllGlobals();
   });
@@ -2738,6 +4529,107 @@ describe("Feature 9: Streaming Integration", () => {
     const toolCalls = msg?.content.filter((b) => b.type === "toolCall");
     expect(toolCalls).toHaveLength(1);
     expect(toolCalls?.[0].type === "toolCall" && toolCalls?.[0].name).toBe("bash");
+
+    vi.unstubAllGlobals();
+  });
+
+  // =========================================================================
+  // XML-dialect tool call recovery (<invoke name="...">)
+  // =========================================================================
+
+  it("recovers an XML-dialect tool call and returns stopReason toolUse (record 279)", async () => {
+    // Reproduces the observed stall: the model emitted its shell call as text in
+    // Anthropic's XML function-calling dialect, so the turn ended
+    // stopReason:"stop" with zero toolCall blocks and the agent loop parked at
+    // the prompt. The assertion that matters is the stopReason flip — that is
+    // what keeps an unattended session moving.
+    const mockFetch = mockFetchOk(`${JSON.stringify({ content: RECORD_279_TEXT })}{"contextUsagePercentage":10}`);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+
+    const toolCalls = msg?.content.filter((b) => b.type === "toolCall");
+    expect(toolCalls).toHaveLength(1);
+    const call = toolCalls?.[0];
+    expect(call?.type === "toolCall" && call.name).toBe("shell");
+    // Byte-exact all the way through JSON.stringify → emitToolCall → JSON.parse.
+    expect(call?.type === "toolCall" && call.arguments.command).toBe(RECORD_279_COMMAND);
+    expect(call?.type === "toolCall" && call.arguments.summary).toBe(RECORD_279_SUMMARY);
+
+    const textBlock = msg?.content.find((b) => b.type === "text");
+    expect(textBlock?.type === "text" && textBlock.text).not.toContain("<invoke name=");
+
+    // The fix: "stop" would stall the agent loop; "toolUse" continues it.
+    expect(done?.type === "done" && done.reason).toBe("toolUse");
+    expect(msg?.stopReason).toBe("toolUse");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("recovers XML-dialect calls split across stream chunks", async () => {
+    // The dialect arrives as ordinary content deltas, so a tag can straddle a
+    // chunk boundary. Recovery runs on the assembled text block, after the
+    // stream ends, so boundaries must not matter.
+    const mid = Math.floor(RECORD_279_TEXT.length / 2);
+    const mockFetch = mockFetchChunked([
+      JSON.stringify({ content: RECORD_279_TEXT.slice(0, mid) }),
+      JSON.stringify({ content: RECORD_279_TEXT.slice(mid) }),
+      '{"contextUsagePercentage":10}',
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    const toolCalls = msg?.content.filter((b) => b.type === "toolCall");
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls?.[0].type === "toolCall" && toolCalls?.[0].arguments.command).toBe(RECORD_279_COMMAND);
+    expect(done?.type === "done" && done.reason).toBe("toolUse");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("does not recover XML-dialect calls when native tool calls exist", async () => {
+    const toolPayload = '{"name":"bash","toolUseId":"tc1","input":"{\\"cmd\\":\\"ls\\"}","stop":true}';
+    const mockFetch = mockFetchOk(
+      `${JSON.stringify({ content: RECORD_279_TEXT })}${toolPayload}{"contextUsagePercentage":10}`,
+    );
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    const toolCalls = msg?.content.filter((b) => b.type === "toolCall");
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls?.[0].type === "toolCall" && toolCalls?.[0].name).toBe("bash");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("leaves prose that merely quotes the dialect alone", async () => {
+    // Model output analysing this bug quotes the dialect inside a code fence.
+    // Recovering from that would execute a command out of documentation.
+    const prose = ["The leak looks like:", "```", RECORD_279_TEXT, "```", "Want me to file a card?"].join("\n");
+    const mockFetch = mockFetchOk(`${JSON.stringify({ content: prose })}{"contextUsagePercentage":10}`);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg?.content.filter((b) => b.type === "toolCall")).toHaveLength(0);
+    const textBlock = msg?.content.find((b) => b.type === "text");
+    expect(textBlock?.type === "text" && textBlock.text).toBe(prose);
+    expect(done?.type === "done" && done.reason).toBe("stop");
 
     vi.unstubAllGlobals();
   });
@@ -3185,4 +5077,940 @@ describe("Feature 9: Streaming Integration", () => {
 
     vi.unstubAllGlobals();
   });
+  it("normalizes cross-provider tool call IDs for Kiro requests", async () => {
+    const openAiToolCallId = "call_7co4xEgttSQcqULvGmpE7qVJ|fc_07f9a04520d21e6a016a912c2adb8487d0aa2368675a637b3b";
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: "Read the file", timestamp: ts },
+        makeToolCall(openAiToolCallId),
+        makeToolResult(openAiToolCallId),
+      ],
+      tools: [{ name: "read", description: "Read a file", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"Done."}{"contextUsagePercentage":8}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const toolUseId = body.conversationState.history
+      .flatMap((entry: KiroHistoryEntry) => entry.assistantResponseMessage?.toolUses ?? [])
+      .at(-1).toolUseId;
+    const toolResultId =
+      body.conversationState.currentMessage.userInputMessage.userInputMessageContext.toolResults[0].toolUseId;
+    expect(toolUseId).toBe(toolResultId);
+    expect(toolUseId).toMatch(/^[a-zA-Z0-9_.:-]{1,64}$/);
+    expect(toolUseId).not.toBe(openAiToolCallId);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("strips historical images when the active model is text-only", async () => {
+    const imageContent: ImageContent = { type: "image", data: "image-data", mimeType: "image/png" };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "Look" }, imageContent], timestamp: ts },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "I saw it" }],
+          api: "kiro-api",
+          provider: "kiro",
+          model: "gpt-text-only",
+          usage: zeroUsage,
+          stopReason: "stop",
+          timestamp: ts,
+        } as AssistantMessage,
+        { role: "user", content: "Describe it again", timestamp: ts },
+      ],
+    };
+    const mockFetch = mockFetchOk('{"content":"No image available"}{"contextUsagePercentage":5}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel({ input: ["text"] }), context, { apiKey: "tok" }));
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(JSON.stringify(body.conversationState.history ?? [])).not.toContain("image-data");
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps only the newest bounded historical image", async () => {
+    const largeImage: ImageContent = { type: "image", data: "y".repeat(500000), mimeType: "image/jpeg" };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "Image 1" }, largeImage], timestamp: ts },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Got it" }],
+          api: "kiro-api",
+          provider: "kiro",
+          model: "claude-sonnet-4-5",
+          usage: zeroUsage,
+          stopReason: "stop",
+          timestamp: ts,
+        } as AssistantMessage,
+        { role: "user", content: [{ type: "text", text: "Image 2" }, largeImage], timestamp: ts },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Got that too" }],
+          api: "kiro-api",
+          provider: "kiro",
+          model: "claude-sonnet-4-5",
+          usage: zeroUsage,
+          stopReason: "stop",
+          timestamp: ts,
+        } as AssistantMessage,
+        { role: "user", content: "Describe both images", timestamp: ts },
+      ],
+    };
+    const mockFetch = mockFetchOk('{"content":"Both were photos."}{"contextUsagePercentage":5}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), context, { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    expect(done).toBeDefined();
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const imageEntries = (body.conversationState.history ?? []).filter(
+      (entry: KiroHistoryEntry) => (entry.userInputMessage?.images?.length ?? 0) > 0,
+    );
+    expect(imageEntries).toHaveLength(1);
+    expect(imageEntries[0].userInputMessage.images[0].source.bytes).toHaveLength(500000);
+    expect(JSON.stringify(body).length).toBeLessThan(850000);
+
+    vi.unstubAllGlobals();
+  });
+
+  // =========================================================================
+  // Silent-failure diagnostics: errorMessage on exhausted retries and on a
+  // tool call dropped for unparseable arguments.
+  //
+  // stopReason stays inside pi's existing union in every case below — a new
+  // member would break every peer — so `errorMessage` is the only channel that
+  // can distinguish these turns from an ordinary completion.
+  // =========================================================================
+
+  /** 4 identical degenerate attempts: 1 initial + 3 retries, all exhausted. */
+  function mockFetchRepeated(body: string, times: number) {
+    const makeResponse = () => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({ done: false, value: encodeBody(body) })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          releaseLock: () => {},
+        }),
+      },
+    });
+    const mockFetch = vi.fn();
+    for (let i = 0; i < times; i++) mockFetch.mockResolvedValueOnce(makeResponse());
+    return mockFetch;
+  }
+
+  it("sets errorMessage when empty-response retries are exhausted, keeping content empty", async () => {
+    const mockFetch = mockFetchRepeated('{"contextUsagePercentage":50}', 4);
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    // The pre-existing contract: still a non-error stop with empty content.
+    expect(msg?.stopReason).toBe("stop");
+    expect(msg?.content).toHaveLength(0);
+    // The new fact: the turn says why it is empty.
+    expect(msg?.errorMessage).toBeDefined();
+    expect(msg?.errorMessage).toContain("no text and no tool calls");
+    expect(msg?.errorMessage).toContain("4 attempts");
+    expect(msg?.errorMessage).toContain('stopReason:"stop"');
+    // Content really is empty on this shape, so the diagnostic may say so. The
+    // reasoning-enabled test below covers the shape where it may not.
+    expect(msg?.errorMessage).toContain("returning empty content");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  }, 30000);
+
+  it("reports the stopReason actually assigned, not a hardcoded 'stop'", async () => {
+    // No contextUsage event at all, so `receivedContextUsage` stays false and the
+    // assignment below picks "length", not "stop". The pre-fix warning and the
+    // diagnostic must not claim "stop" here.
+    const mockFetch = mockFetchRepeated('{"content":""}', 4);
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg?.stopReason).toBe("length");
+    expect(msg?.errorMessage).toContain('stopReason:"length"');
+    expect(msg?.errorMessage).not.toContain('stopReason:"stop"');
+    // `{"content":""}` never creates a text block at all: the content handler's
+    // dedup guard compares against `lastContentData`, which also starts as "", so
+    // the event is skipped. Content is genuinely empty here, and the clause says so
+    // without blaming a discarded attempt.
+    expect(msg?.content).toHaveLength(0);
+    expect(msg?.errorMessage).toContain("returning empty content");
+    expect(msg?.errorMessage).not.toContain("discarded attempts");
+
+    const exhaustionWarning = warnSpy.mock.calls
+      .map((c) => String(c[0]))
+      .find((m) => m.includes("retry budget exhausted"));
+    expect(exhaustionWarning).toBeDefined();
+    expect(exhaustionWarning).toContain('stopReason:"length"');
+    expect(exhaustionWarning).not.toContain('stopReason:"stop"');
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  }, 30000);
+
+  it("sets errorMessage when echo-loop retries are exhausted, keeping the stripped text block", async () => {
+    const mockFetch = mockFetchRepeated('{"content":"Continue"}{"contextUsagePercentage":10}', 4);
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg?.stopReason).toBe("stop");
+    // Pre-existing contract: the text block survives, emptied — not removed.
+    const textBlocks = msg?.content.filter((b) => b.type === "text") ?? [];
+    expect(textBlocks).toHaveLength(1);
+    expect((textBlocks[0] as TextContent).text).toBe("");
+    // The new fact names the echo pattern that was stripped.
+    expect(msg?.errorMessage).toContain("echoed its own continuation prompt");
+    expect(msg?.errorMessage).toContain('"Continue"');
+    expect(msg?.errorMessage).toContain("4 attempts");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  }, 30000);
+
+  it("sets errorMessage naming the tool when a tool call is dropped for unparseable arguments", async () => {
+    const toolPayload = '{"name":"bash","toolUseId":"tc1","input":"not-json","stop":true}';
+    const mockFetch = mockFetchOk(`${toolPayload}{"contextUsagePercentage":10}`);
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    // No retry: the API did respond, it just sent a malformed call.
+    expect(mockFetch).toHaveBeenCalledOnce();
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg?.content.filter((b) => b.type === "toolCall")).toHaveLength(0);
+    expect(msg?.stopReason).not.toBe("toolUse");
+    expect(msg?.errorMessage).toContain("unparseable arguments");
+    expect(decodedDroppedToolNames(msg?.errorMessage)).toEqual(["bash"]);
+    expect(msg?.errorMessage).toContain("never reached the agent");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("names every dropped tool call, and keeps the ones that parsed", async () => {
+    const bad1 = '{"name":"bash","toolUseId":"tc1","input":"{oops","stop":true}';
+    const good = '{"name":"read","toolUseId":"tc2","input":"{\\"path\\":\\"/tmp/a\\"}","stop":true}';
+    const bad2 = '{"name":"write","toolUseId":"tc3","input":"also-not-json","stop":true}';
+    const mockFetch = mockFetchOk(`${bad1}${good}${bad2}{"contextUsagePercentage":10}`);
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    // The parseable call still went through, so the turn is a real toolUse turn
+    // that is nonetheless missing two calls the model made.
+    expect(msg?.content.filter((b) => b.type === "toolCall")).toHaveLength(1);
+    expect(msg?.stopReason).toBe("toolUse");
+    expect(msg?.errorMessage).toContain("tool calls with unparseable arguments");
+    expect(decodedDroppedToolNames(msg?.errorMessage)).toEqual(["bash", "write"]);
+    expect(decodedDroppedToolNames(msg?.errorMessage)).not.toContain("read");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("records a drop from the final flush, when the call never got a stop frame", async () => {
+    // There are two `currentToolCall` drop seams and they are reached by different
+    // wire shapes. `stop:true` (and a `toolUseStop` frame) flush inside the event
+    // loop, so every other drop test above exercises only the incremental seam in
+    // `flushToolCall`. A tool call whose frame carries no `stop` at all is left in
+    // `currentToolCall` when the stream drains, and is emitted by the FINAL flush
+    // after the loop — the seam this test pins. `stop` is optional on the parsed
+    // `toolUse` event, so this is a shape the wire can actually produce.
+    const noStop = '{"name":"bash","toolUseId":"tc1","input":"not-json"}';
+    const mockFetch = mockFetchOk(`${noStop}{"contextUsagePercentage":10}`);
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg?.content.filter((b) => b.type === "toolCall")).toHaveLength(0);
+    expect(msg?.errorMessage).toContain("unparseable arguments");
+    expect(decodedDroppedToolNames(msg?.errorMessage)).toEqual(["bash"]);
+    expect(msg?.errorMessage).toContain("never reached the agent");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("does not run bracket recovery for a dropped native call, and says the call was lost", async () => {
+    // `sawAnyToolCalls` is true (the native call arrived), so the bracket fallback
+    // stays gated off even though the text carries a bracket-shaped call. The
+    // diagnostic is what makes the loss visible instead.
+    const badNative = '{"name":"bash","toolUseId":"tc1","input":"not-json","stop":true}';
+    const mockFetch = mockFetchOk(
+      `{"content":"[Called read with args: {\\"path\\": \\"/tmp/a\\"}]"}${badNative}{"contextUsagePercentage":10}`,
+    );
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg?.content.filter((b) => b.type === "toolCall")).toHaveLength(0);
+    expect(decodedDroppedToolNames(msg?.errorMessage)).toEqual(["bash"]);
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("counts only the degenerate attempts, not retries spent on a stream error", async () => {
+    // `retryCount` is one shared budget: a mid-stream error on attempt 1 spends
+    // part of it, so exhaustion arrives after THREE empty attempts, not four.
+    // The diagnostic must say three — reporting `maxRetries + 1` would assert an
+    // empty attempt that never happened, and attempt 1 was not even empty (it
+    // streamed text before failing).
+    const empty = '{"contextUsagePercentage":50}';
+    const makeResponse = (body: string) => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({ done: false, value: encodeBody(body) })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          releaseLock: () => {},
+          cancel: async () => {},
+        }),
+        cancel: async () => {},
+      },
+    });
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(makeResponse('{"content":"partial"}{"error":"transient"}'))
+      .mockResolvedValueOnce(makeResponse(empty))
+      .mockResolvedValueOnce(makeResponse(empty))
+      .mockResolvedValueOnce(makeResponse(empty));
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg?.errorMessage).toContain("3 attempts");
+    expect(msg?.errorMessage).not.toContain("4 attempts");
+    expect(msg?.errorMessage).toContain("retry budget exhausted");
+
+    const exhaustionWarning = warnSpy.mock.calls
+      .map((c) => String(c[0]))
+      .find((m) => m.includes("retry budget exhausted"));
+    expect(exhaustionWarning).toContain("3 attempts");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  }, 30000);
+
+  it("reports a single degenerate attempt when other retries spent the whole budget", async () => {
+    // Three mid-stream errors spend the entire budget, so the first empty attempt
+    // is also the last. One attempt is one attempt — not four, and not plural.
+    const makeResponse = (body: string) => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({ done: false, value: encodeBody(body) })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          releaseLock: () => {},
+          cancel: async () => {},
+        }),
+        cancel: async () => {},
+      },
+    });
+    const streamErr = '{"content":"partial"}{"error":"transient"}';
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(makeResponse(streamErr))
+      .mockResolvedValueOnce(makeResponse(streamErr))
+      .mockResolvedValueOnce(makeResponse(streamErr))
+      .mockResolvedValueOnce(makeResponse('{"contextUsagePercentage":50}'));
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg?.errorMessage).toContain("on 1 attempt;");
+    expect(msg?.errorMessage).not.toMatch(/\b1 attempts\b/);
+    expect(msg?.errorMessage).not.toContain("on 4 attempts");
+    // Attempts 1-3 each streamed "partial" before failing, and `output.content` is
+    // NOT reset on the mid-stream-error retry (only on the degenerate one), so the
+    // persisted message still holds those three discarded text blocks while
+    // `hasText` is false. The diagnostic must not read "returning only text
+    // content" here — that contradicts its own "no text" clause in the same
+    // sentence. It has to say whose text it is.
+    expect(msg?.content.filter((b) => b.type === "text")).toHaveLength(3);
+    expect(msg?.errorMessage).toContain("returning only text content left by earlier discarded attempts");
+    expect(msg?.errorMessage).not.toContain("returning empty content");
+    expect(CONSUMER_RETRYABLE_RE.exec(msg?.errorMessage ?? "")?.[0]).toBeUndefined();
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  }, 30000);
+
+  it("does not call the degenerate attempts consecutive when a 403 refresh interleaved them", async () => {
+    // The degenerate attempts need not be adjacent. A 403 spends the same shared
+    // `retryCount` budget and re-enters the outer loop, so attempts 1, 3 and 4 can
+    // be empty while attempt 2 was a credential refresh. The count is still 3, but
+    // asserting they were *consecutive* would describe a run that never happened.
+    const empty = '{"contextUsagePercentage":50}';
+    const makeResponse = () => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({ done: false, value: encodeBody(empty) })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          releaseLock: () => {},
+        }),
+      },
+    });
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(makeResponse())
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+        statusText: "Forbidden",
+        text: () => Promise.resolve("Access denied"),
+      })
+      .mockResolvedValueOnce(makeResponse())
+      .mockResolvedValueOnce(makeResponse());
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg?.errorMessage).toContain("3 attempts");
+    expect(msg?.errorMessage).not.toContain("consecutive");
+
+    const exhaustionWarning = warnSpy.mock.calls
+      .map((c) => String(c[0]))
+      .find((m) => m.includes("retry budget exhausted"));
+    expect(exhaustionWarning).toContain("3 attempts");
+    expect(exhaustionWarning).not.toContain("consecutive");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  }, 30000);
+
+  it("caps the echoed text quoted into errorMessage instead of persisting it whole", async () => {
+    // The echo pattern admits an unbounded run of dots, and `errorMessage` is
+    // persisted on the assistant record, so the quote has to be capped. The exact
+    // length goes to `console.warn` only — see the retryable-classifier regression
+    // below for why no unbounded integer may reach the persisted string.
+    const longEcho = ".".repeat(5000);
+    const mockFetch = mockFetchRepeated(`{"content":"${longEcho}"}{"contextUsagePercentage":10}`, 4);
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg?.errorMessage).toBeDefined();
+    expect(msg?.errorMessage).toContain("echoed its own continuation prompt");
+    expect(msg?.errorMessage).toContain("(truncated)");
+    expect(msg?.errorMessage).not.toContain(longEcho);
+    // The exact length is NOT in the persisted string — see the retryable-classifier
+    // regression below — but it is still reported on the console.
+    expect(msg?.errorMessage).not.toContain("5000");
+    const stripWarning = warnSpy.mock.calls.map((c) => String(c[0])).find((m) => m.includes("Echo loop persisted"));
+    expect(stripWarning).toContain("5000 chars");
+    // 200 quoted chars plus the surrounding diagnostic prose, nowhere near 5000.
+    expect((msg?.errorMessage ?? "").length).toBeLessThan(600);
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  }, 30000);
+
+  // A diagnostic that says "terminal, do not retry" is worthless if the consumer
+  // reading it decides it is transient. The predicate below is copied verbatim from
+  // Kermes `isRetryableStreamError` (src/errors.ts), which gates the exact
+  // `errorMessage` these diagnostics write: headless.ts and acp_server/agent.ts
+  // suppress any trailing-assistant errorMessage it accepts. Note the bare
+  // `429|500|502|503|504` alternatives with no word boundary — that is why no
+  // unbounded integer may appear in a persisted diagnostic.
+  const CONSUMER_RETRYABLE_RE =
+    /overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|stream ended before message_stop|http2 request did not get a response|timed? out|timeout|terminated|retry delay/i;
+
+  /** Reverse the provider's A–P UTF-16 encoding to prove tool identity survives. */
+  function decodedDroppedToolNames(errorMessage: string | undefined): string[] {
+    return [...(errorMessage ?? "").matchAll(/A-P:([A-P]+)/g)].map(([, encoded]) => {
+      if (encoded.length % 4 !== 0) throw new Error(`Malformed diagnostic tool name: ${encoded}`);
+      let decoded = "";
+      for (let i = 0; i < encoded.length; i += 4) {
+        const codeUnit =
+          (encoded.charCodeAt(i) - 65) * 4096 +
+          (encoded.charCodeAt(i + 1) - 65) * 256 +
+          (encoded.charCodeAt(i + 2) - 65) * 16 +
+          encoded.charCodeAt(i + 3) -
+          65;
+        decoded += String.fromCharCode(codeUnit);
+      }
+      return decoded;
+    });
+  }
+
+  // Echo lengths whose digits collide with that predicate's HTTP-status
+  // alternatives. 5000 is the length used by the capping test above, so the
+  // pre-fix `(5000 chars total)` annotation matched `500` and made retry
+  // exhaustion look like a transient HTTP 500.
+  for (const echoLength of [429, 500, 504, 5000]) {
+    it(`keeps the exhausted-echo diagnostic terminal for a ${echoLength}-char echo`, async () => {
+      const echo = ".".repeat(echoLength);
+      const mockFetch = mockFetchRepeated(`{"content":"${echo}"}{"contextUsagePercentage":10}`, 4);
+      vi.stubGlobal("fetch", mockFetch);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+      const events = await collect(stream);
+
+      const done = events.find((e) => e.type === "done");
+      const msg = done?.type === "done" ? done.message : undefined;
+      expect(msg?.errorMessage).toContain("echoed its own continuation prompt");
+      const match = CONSUMER_RETRYABLE_RE.exec(msg?.errorMessage ?? "");
+      expect(match?.[0], `consumer would retry this terminal diagnostic: ${msg?.errorMessage}`).toBeUndefined();
+
+      warnSpy.mockRestore();
+      vi.unstubAllGlobals();
+    }, 30000);
+  }
+
+  it("keeps the exhausted-empty-response diagnostic terminal", async () => {
+    const mockFetch = mockFetchRepeated('{"contextUsagePercentage":50}', 4);
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg?.errorMessage).toContain("no text and no tool calls");
+    expect(CONSUMER_RETRYABLE_RE.exec(msg?.errorMessage ?? "")?.[0]).toBeUndefined();
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  }, 30000);
+
+  /** Drives one attempt per body, in order. */
+  function mockFetchSequence(bodies: string[]) {
+    const mockFetch = vi.fn();
+    for (const body of bodies) {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: vi
+              .fn()
+              .mockResolvedValueOnce({ done: false, value: encodeBody(body) })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            releaseLock: () => {},
+          }),
+        },
+      });
+    }
+    return mockFetch;
+  }
+
+  // The two degenerate shapes are counted separately, because the exhaustion
+  // diagnostic is worded from the LAST attempt's shape alone. A single pooled
+  // counter would attribute every degenerate attempt to whichever shape happened
+  // to land last — the same class of over-claim as reporting `maxRetries + 1`.
+
+  it("does not attribute an echoing attempt to the empty-response count", async () => {
+    const echo = '{"content":"Continue"}{"contextUsagePercentage":10}';
+    const empty = '{"contextUsagePercentage":50}';
+    const mockFetch = mockFetchSequence([echo, empty, empty, empty]);
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    // Attempt 1 carried text, so only THREE attempts returned no text at all.
+    expect(msg?.errorMessage).toContain("no text and no tool calls on 3 attempts");
+    expect(msg?.errorMessage).not.toContain("4 attempts");
+    // The echoing attempt is still reported — named as its own shape, not merged.
+    expect(msg?.errorMessage).toContain("1 attempt that echoed the continuation prompt");
+    expect(CONSUMER_RETRYABLE_RE.exec(msg?.errorMessage ?? "")?.[0]).toBeUndefined();
+
+    const exhaustionWarning = warnSpy.mock.calls
+      .map((c) => String(c[0]))
+      .find((m) => m.includes("retry budget exhausted"));
+    expect(exhaustionWarning).toContain("Empty response on 3 attempts");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  }, 30000);
+
+  it("does not attribute an empty attempt to the echo count", async () => {
+    const echo = '{"content":"Continue"}{"contextUsagePercentage":10}';
+    const empty = '{"contextUsagePercentage":50}';
+    const mockFetch = mockFetchSequence([empty, empty, empty, echo]);
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    // Exactly one attempt echoed, even though four were degenerate.
+    expect(msg?.errorMessage).toContain("on 1 attempt");
+    expect(msg?.errorMessage).not.toContain("on 4 attempts");
+    expect(msg?.errorMessage).toContain("3 attempts with no text at all");
+    // The stripped text block is still the echo case's contract.
+    const textBlocks = msg?.content.filter((b) => b.type === "text") ?? [];
+    expect(textBlocks).toHaveLength(1);
+    expect((textBlocks[0] as TextContent).text).toBe("");
+    expect(CONSUMER_RETRYABLE_RE.exec(msg?.errorMessage ?? "")?.[0]).toBeUndefined();
+
+    const stripWarning = warnSpy.mock.calls.map((c) => String(c[0])).find((m) => m.includes("Echo loop persisted"));
+    expect(stripWarning).toContain("across 1 attempt");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  }, 30000);
+
+  it("fingerprints an oversized dropped-name set without emitting a partial identity or call count", async () => {
+    // Many drops in one turn exceed the reversible-name budget. The diagnostic
+    // substitutes one fixed-size whole-set fingerprint instead of slicing a
+    // valid-looking name prefix or dropping later identities silently.
+    const toolNames = Array.from({ length: 12 }, (_, i) => `tool_${i}_${"x".repeat(24)}`);
+    const drops = toolNames
+      .map((name, i) => JSON.stringify({ name, toolUseId: `tc${i}`, input: "not-json", stop: true }))
+      .join("");
+    const mockFetch = mockFetchOk(`${drops}{"contextUsagePercentage":10}`);
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg?.errorMessage).toContain("tool calls with unparseable arguments");
+    expect(msg?.errorMessage).toMatch(/A-P-DIGEST:[A-P]{64} \(tool identities fingerprinted\)/);
+    expect(decodedDroppedToolNames(msg?.errorMessage)).toEqual([]);
+    expect(msg?.errorMessage).not.toContain(toolNames[0]);
+    expect(msg?.errorMessage).toContain("never reached the agent");
+    expect(msg?.errorMessage).not.toMatch(/\b12\b/);
+    expect((msg?.errorMessage ?? "").length).toBeLessThan(300);
+    expect(CONSUMER_RETRYABLE_RE.exec(msg?.errorMessage ?? "")?.[0]).toBeUndefined();
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("leaves errorMessage unset on a healthy turn", async () => {
+    const mockFetch = mockFetchOk('{"content":"Real work."}{"contextUsagePercentage":10}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg?.stopReason).toBe("stop");
+    expect(msg?.errorMessage).toBeUndefined();
+
+    vi.unstubAllGlobals();
+  });
+
+  it("leaves errorMessage unset when a degenerate attempt later recovers", async () => {
+    // Retry exhaustion is the trigger, not the first degenerate attempt.
+    const emptyResponse = '{"contextUsagePercentage":50}';
+    const goodResponse = '{"content":"recovered"}{"contextUsagePercentage":10}';
+    const makeResponse = (body: string) => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({ done: false, value: encodeBody(body) })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          releaseLock: () => {},
+        }),
+      },
+    });
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(makeResponse(emptyResponse))
+      .mockResolvedValueOnce(makeResponse(goodResponse));
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg?.errorMessage).toBeUndefined();
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  }, 30000);
+
+  it("does not carry a discarded attempt's dropped call into the retry that recovered", async () => {
+    // Attempt 1: text-free degenerate turn that ALSO dropped a call. Attempt 2 is
+    // clean. `droppedToolCalls` is per-attempt, so the recovered turn must be
+    // diagnostic-free — otherwise every retry inherits the discarded attempt.
+    const droppedOnly = '{"name":"bash","toolUseId":"tc1","input":"not-json","stop":true}';
+    const goodResponse = '{"content":"recovered"}{"contextUsagePercentage":10}';
+    const makeResponse = (body: string) => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({ done: false, value: encodeBody(body) })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          releaseLock: () => {},
+          // The mid-stream error path cancels the reader before retrying.
+          cancel: async () => {},
+        }),
+      },
+    });
+    // Attempt 1 has no contextUsage and no text, but `sawAnyToolCalls` is true, so
+    // it does NOT trigger the empty-response retry. Drive the retry from a stream
+    // error instead, which is the shape that does retry with drops already recorded.
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(makeResponse(`${droppedOnly}{"error":"transient"}`))
+      .mockResolvedValueOnce(makeResponse(goodResponse));
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg?.errorMessage).toBeUndefined();
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  }, 30000);
+
+  it("does not claim empty content when a degenerate reasoning turn left a thinking block", async () => {
+    // "No text and no tool calls" does not imply empty content. A reasoning turn
+    // that emits only `thinkingText` and then ends is degenerate by that exact
+    // test, so it takes the empty-response branch — but its thinking block is
+    // still in `output.content` when the diagnostic is written. Saying `returning
+    // empty content` there asserts something that did not happen, which is the
+    // one thing these diagnostics exist to stop doing.
+    const mockFetch = mockFetchRepeated('{"text":"pondering"}{"contextUsagePercentage":50}', 4);
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stream = streamKiro(makeModel({ reasoning: true }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    // Pre-existing contract: the thinking block survives the exhaustion.
+    expect(msg?.content.filter((b) => b.type === "thinking")).toHaveLength(1);
+    expect(msg?.content.filter((b) => b.type === "text")).toHaveLength(0);
+    expect(msg?.errorMessage).toContain("no text and no tool calls on 4 attempts");
+    // Reports what is actually being returned, and does not claim otherwise.
+    expect(msg?.errorMessage).toContain("returning only thinking content");
+    expect(msg?.errorMessage).not.toContain("empty content");
+    // Block TYPES only: a count would be an unbounded integer.
+    expect(msg?.errorMessage).not.toMatch(/\b1 thinking\b/);
+    expect(CONSUMER_RETRYABLE_RE.exec(msg?.errorMessage ?? "")?.[0]).toBeUndefined();
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  }, 30000);
+
+  it("does not say 'no tool calls' and 'returning only toolCall content' in one sentence", async () => {
+    // The same trap as the surviving-text case, one kind over. Each of the first
+    // three attempts emits a PARSEABLE tool call and then dies mid-stream; that
+    // retry path does not reset `output.content` (only the degenerate one does),
+    // so three toolCall blocks accumulate while the whole budget is spent. Attempt
+    // 4 is the first degenerate one, so the diagnostic is written over content it
+    // did not produce. Calling that "returning only toolCall content" contradicts
+    // the "no tool calls" clause beside it.
+    const toolThenErr = `${'{"name":"bash","toolUseId":"tc1","input":"{\\"cmd\\":\\"ls\\"}","stop":true}'}{"error":"transient"}`;
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(mockResponseOnce(toolThenErr))
+      .mockResolvedValueOnce(mockResponseOnce(toolThenErr))
+      .mockResolvedValueOnce(mockResponseOnce(toolThenErr))
+      .mockResolvedValueOnce(mockResponseOnce('{"contextUsagePercentage":50}'));
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    // Three discarded attempts' calls really are still on the message. Leaking them
+    // is pre-existing behaviour; describing them wrongly is what this pins.
+    expect(msg?.content.filter((b) => b.type === "toolCall")).toHaveLength(3);
+    expect(msg?.errorMessage).toContain("no text and no tool calls on 1 attempt;");
+    expect(msg?.errorMessage).toContain("returning only toolCall content left by earlier discarded attempts");
+    // The exact self-contradiction, spelled out so a regression cannot pass by
+    // merely containing the right substring somewhere else in the sentence.
+    expect(msg?.errorMessage).not.toMatch(/returning only toolCall content with/);
+    expect(msg?.errorMessage).not.toContain("returning empty content");
+    expect(CONSUMER_RETRYABLE_RE.exec(msg?.errorMessage ?? "")?.[0]).toBeUndefined();
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  }, 60000);
+
+  it("names its own thinking and a discarded attempt's blocks separately when both survive", async () => {
+    // The partition is per KIND, not per message, and this is the shape that
+    // proves a single boolean cannot express it: a reasoning turn whose thinking
+    // block is its OWN, over text and a toolCall left by discarded attempts. One
+    // flag would either blame this attempt's thinking on a discarded one or claim
+    // the discarded blocks as its own. Both halves have to be said.
+    const rich = `{"content":"partial"}${'{"name":"bash","toolUseId":"tc1","input":"{\\"cmd\\":\\"ls\\"}","stop":true}'}{"error":"transient"}`;
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(mockResponseOnce(rich))
+      .mockResolvedValueOnce(mockResponseOnce(rich))
+      .mockResolvedValueOnce(mockResponseOnce(rich))
+      .mockResolvedValueOnce(mockResponseOnce('{"text":"pondering"}{"contextUsagePercentage":50}'));
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stream = streamKiro(makeModel({ reasoning: true }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg?.content.filter((b) => b.type === "thinking")).toHaveLength(1);
+    expect(msg?.content.filter((b) => b.type === "text")).toHaveLength(3);
+    expect(msg?.content.filter((b) => b.type === "toolCall")).toHaveLength(3);
+    // This attempt's own thinking, then what it inherited -- named apart.
+    expect(msg?.errorMessage).toContain("returning only thinking content");
+    expect(msg?.errorMessage).toContain("plus text and toolCall content left by earlier discarded attempts");
+    // Never the flattened claim that all three kinds are this attempt's.
+    expect(msg?.errorMessage).not.toContain("returning only text and thinking and toolCall content");
+    expect(CONSUMER_RETRYABLE_RE.exec(msg?.errorMessage ?? "")?.[0]).toBeUndefined();
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  }, 60000);
+
+  it("keeps a malformed non-string tool name observable without crashing", async () => {
+    // parseKiroEvent currently accepts any truthy JSON `name` and casts it to a
+    // string. Preserve that malformed wire identity instead of throwing on a
+    // string-only method and replacing the dropped-call fact with a generic error.
+    const malformedName = ["bash"];
+    const dropped = JSON.stringify({ name: malformedName, toolUseId: "tc1", input: "not-json", stop: true });
+    const mockFetch = mockFetchOk(`${dropped}{"contextUsagePercentage":10}`);
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(decodedDroppedToolNames(msg?.errorMessage)).toEqual(['object:["bash"]']);
+    expect(CONSUMER_RETRYABLE_RE.exec(msg?.errorMessage ?? "")?.[0]).toBeUndefined();
+    expect(events.some((event) => event.type === "error")).toBe(false);
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  for (const [label, toolName] of [
+    ["HTTP-code name", "http500_probe"],
+    ["retry-word name", "set_timeout"],
+    ["ordinary name", "safe_tool"],
+    ["unpaired-surrogate name", "x\ud800y"],
+  ] as const) {
+    it(`keeps the dropped-call diagnostic terminal while preserving ${label}`, async () => {
+      // Tool names are model-provided text. Names containing HTTP codes or retry
+      // words must not make this terminal failure look transient to consumers.
+      const dropped = JSON.stringify({ name: toolName, toolUseId: "tc1", input: "not-json", stop: true });
+      const mockFetch = mockFetchOk(`${dropped}{"contextUsagePercentage":10}`);
+      vi.stubGlobal("fetch", mockFetch);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+      const events = await collect(stream);
+
+      const done = events.find((e) => e.type === "done");
+      const msg = done?.type === "done" ? done.message : undefined;
+      expect(decodedDroppedToolNames(msg?.errorMessage)).toEqual([toolName]);
+      expect(CONSUMER_RETRYABLE_RE.exec(msg?.errorMessage ?? "")?.[0]).toBeUndefined();
+      expect(msg?.errorMessage).not.toContain(toolName);
+
+      warnSpy.mockRestore();
+      vi.unstubAllGlobals();
+    });
+  }
 });

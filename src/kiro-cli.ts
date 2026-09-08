@@ -11,6 +11,9 @@ import type { KiroAuthMethod, KiroCredentials } from "./oauth.js";
 
 const require = createRequire(import.meta.url);
 
+/** kiro-cli's secret-store key for an enterprise external IdP (OIDC) session. */
+const EXTERNAL_IDP_TOKEN_KEY = "kirocli:external-idp:token";
+
 export function getKiroCliDbPath(): string | undefined {
   const p = platform();
   let dbPath: string;
@@ -99,6 +102,11 @@ export function getKiroCliCredentials(): KiroCredentials | undefined {
     const desktopCreds = tryKiroCliToken(dbPath, "kirocli:social:token", "desktop");
     if (desktopCreds) return desktopCreds;
 
+    // Enterprise external IdP (OIDC) login — refreshed against the customer's
+    // own token endpoint rather than AWS SSO
+    const externalIdpCreds = tryKiroCliToken(dbPath, EXTERNAL_IDP_TOKEN_KEY, "external-idp");
+    if (externalIdpCreds) return externalIdpCreds;
+
     return undefined;
   } catch {
     return undefined;
@@ -119,6 +127,9 @@ export function getKiroCliCredentialsAllowExpired(): KiroCredentials | undefined
 
     const desktopCreds = tryKiroCliToken(dbPath, "kirocli:social:token", "desktop", true);
     if (desktopCreds) return desktopCreds;
+
+    const externalIdpCreds = tryKiroCliToken(dbPath, EXTERNAL_IDP_TOKEN_KEY, "external-idp", true);
+    if (externalIdpCreds) return externalIdpCreds;
 
     return undefined;
   } catch {
@@ -156,6 +167,28 @@ function tryKiroCliToken(
     };
   }
 
+  // External IdP — the customer's own OIDC app. It is a public PKCE client, so
+  // there is no client secret; carry the token endpoint through the refresh
+  // string because it is per-tenant and not derivable from a region.
+  if (authMethod === "external-idp") {
+    const idpClientId = tokenData.client_id || tokenData.clientId || "";
+    const issuerUrl: string = tokenData.issuer_url || "";
+    const tokenEndpoint =
+      tokenData.token_endpoint ||
+      tokenData.tokenEndpoint ||
+      (issuerUrl ? `${issuerUrl.replace(/\/+$/, "")}/v1/token` : "");
+    return {
+      refresh: `${tokenData.refresh_token}|${idpClientId}|${tokenEndpoint}|external-idp`,
+      access: tokenData.access_token,
+      expires: expiresAt,
+      clientId: idpClientId,
+      clientSecret: "",
+      region,
+      authMethod: "external-idp",
+      profileArn: tokenData.profile_arn || tokenData.profileArn,
+    };
+  }
+
   // IDC — need device registration credentials for refresh
   let clientId = "";
   let clientSecret = "";
@@ -180,6 +213,7 @@ function tryKiroCliToken(
     clientSecret,
     region,
     authMethod: "idc",
+    profileArn: tokenData.profile_arn || tokenData.profileArn,
   };
 }
 
@@ -218,6 +252,8 @@ export function getKiroCliSocialTokenAllowExpired(): KiroCredentials | undefined
 const TOKEN_KEY_BY_AUTH_METHOD: Record<KiroAuthMethod, string[]> = {
   idc: ["kirocli:odic:token", "codewhisperer:odic:token"],
   desktop: ["kirocli:social:token"],
+  "external-idp": [EXTERNAL_IDP_TOKEN_KEY],
+  apikey: [],
 };
 
 export function saveKiroCliCredentials(creds: KiroCredentials): void {
@@ -241,8 +277,12 @@ export function saveKiroCliCredentials(creds: KiroCredentials): void {
       tokenData.access_token = creds.access;
       tokenData.refresh_token = rawRefreshToken;
       tokenData.expires_at = expiresAt;
-      if (creds.region) tokenData.region = creds.region;
-      if (creds.profileArn) tokenData.profile_arn = creds.profileArn;
+      // kiro-cli's ExternalIdpToken record has no region/profile_arn fields;
+      // don't add keys it never wrote.
+      if (creds.authMethod !== "external-idp") {
+        if (creds.region) tokenData.region = creds.region;
+        if (creds.profileArn) tokenData.profile_arn = creds.profileArn;
+      }
 
       const escaped = JSON.stringify(tokenData).replace(/'/g, "''");
       const sql = `UPDATE auth_kv SET value = '${escaped}' WHERE key = '${key}';`;

@@ -1,17 +1,21 @@
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { getSupportedThinkingLevels, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { deriveKiroEffort } from "../src/effort.js";
 import type { KiroCatalogModel } from "../src/management.js";
 import {
+  deriveThinkingConfig,
   getCachedModels,
   isCacheStale,
   KIRO_MANAGEMENT_CACHE_PATH,
   KIRO_MANAGEMENT_CACHE_SOURCE,
   KIRO_MANAGEMENT_CACHE_VERSION,
   KIRO_MODEL_IDS,
+  type KiroModel,
   kiroModels,
+  LEGACY_HOME_CACHE_PATH,
   mapKiroCatalogModels,
   resolveApiRegion,
   resolveKiroModel,
@@ -22,7 +26,11 @@ const LEGACY_CACHE_PATH = join(homedir(), ".kiro-models-cache.json");
 const TEST_REGION = "test-region-1";
 const PROFILE_ARN = "arn:aws:codewhisperer:test-region-1:123456789012:profile/test";
 
-function effortSchema(field: "reasoning" | "output_config", values: string[]): Record<string, unknown> {
+function effortSchema(
+  field: "reasoning" | "output_config",
+  values: string[],
+  summarizedThinking = false,
+): Record<string, unknown> {
   return {
     type: "object",
     properties: {
@@ -31,6 +39,9 @@ function effortSchema(field: "reasoning" | "output_config", values: string[]): R
         properties: { effort: { type: "string", enum: values } },
         additionalProperties: false,
       },
+      ...(summarizedThinking
+        ? { thinking: { type: "object", properties: { display: { enum: ["summarized", "omitted"] } } } }
+        : {}),
     },
     additionalProperties: false,
   };
@@ -44,10 +55,16 @@ const catalogFixture: KiroCatalogModel[] = [
     additionalModelRequestFieldsSchema: effortSchema("reasoning", ["none", "low", "medium", "high", "xhigh", "max"]),
   },
   {
+    modelId: "gpt-5.6-luna",
+    displayName: "GPT 5.6 Luna",
+    tokenLimits: { maxInputTokens: 300_000, maxOutputTokens: 128_000 },
+    additionalModelRequestFieldsSchema: effortSchema("reasoning", ["none", "low", "medium", "high", "xhigh", "max"]),
+  },
+  {
     modelId: "claude-opus-4.8",
     displayName: "Catalog Opus 4.8",
     tokenLimits: { maxInputTokens: 900_000, maxOutputTokens: 100_000 },
-    additionalModelRequestFieldsSchema: effortSchema("output_config", ["low", "medium", "high", "xhigh", "max"]),
+    additionalModelRequestFieldsSchema: effortSchema("output_config", ["low", "medium", "high", "xhigh", "max"], true),
   },
   {
     modelId: "claude-sonnet-4.6",
@@ -62,13 +79,16 @@ const catalogFixture: KiroCatalogModel[] = [
 ];
 
 beforeEach(() => {
+  mkdirSync(dirname(KIRO_MANAGEMENT_CACHE_PATH), { recursive: true });
   rmSync(KIRO_MANAGEMENT_CACHE_PATH, { force: true });
+  rmSync(LEGACY_HOME_CACHE_PATH, { force: true });
   rmSync(LEGACY_CACHE_PATH, { force: true });
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
   rmSync(KIRO_MANAGEMENT_CACHE_PATH, { force: true });
+  rmSync(LEGACY_HOME_CACHE_PATH, { force: true });
   rmSync(LEGACY_CACHE_PATH, { force: true });
 });
 
@@ -101,6 +121,7 @@ describe("Feature 2: Model Definitions", () => {
       ["us-east-2", "us-east-1"],
       ["eu-west-1", "eu-central-1"],
       ["ap-southeast-2", "us-east-1"],
+      ["ap-northeast-2", "us-east-1"],
       ["us-east-1", "us-east-1"],
       [undefined, "us-east-1"],
     ])("maps %s to %s", (ssoRegion, apiRegion) => {
@@ -155,11 +176,18 @@ describe("Feature 2: Model Definitions", () => {
       expect(mapped.find((model) => model.id === expected.id)).toMatchObject(expected);
     });
 
+    it("advertises verified Luna vision without broadening other non-Claude models", () => {
+      expect(mapped.find((model) => model.id === "gpt-5-6-luna")?.input).toEqual(["text", "image"]);
+      expect(mapped.find((model) => model.id === "openai-gpt-5-6")?.input).toEqual(["text"]);
+      expect(mapped.find((model) => model.id === "qwen3-coder-next")?.input).toEqual(["text"]);
+    });
+
     it("retains fresh schema and token metadata for a model also present in the bootstrap list", () => {
       const opus = mapped.find((model) => model.id === "claude-opus-4-8");
       expect(opus?.name).toBe("Catalog Opus 4.8");
-      expect(opus?.additionalModelRequestFieldsSchema).toEqual(catalogFixture[1].additionalModelRequestFieldsSchema);
-      expect(opus?.tokenLimits).toEqual(catalogFixture[1].tokenLimits);
+      const catalogOpus = catalogFixture.find((model) => model.modelId === "claude-opus-4.8");
+      expect(opus?.additionalModelRequestFieldsSchema).toEqual(catalogOpus?.additionalModelRequestFieldsSchema);
+      expect(opus?.tokenLimits).toEqual(catalogOpus?.tokenLimits);
       expect(opus?.contextWindow).not.toBe(kiroModels.find((model) => model.id === opus?.id)?.contextWindow);
     });
 
@@ -197,6 +225,12 @@ describe("Feature 2: Model Definitions", () => {
   });
 
   describe("management model cache", () => {
+    it("uses ~/.pi/agent as the primary version 2 cache location", () => {
+      expect(KIRO_MANAGEMENT_CACHE_PATH).toBe(join(homedir(), ".pi", "agent", "kiro-management-models-cache.json"));
+      expect(LEGACY_HOME_CACHE_PATH).toBe(join(homedir(), ".kiro-management-models-cache.json"));
+      expect(KIRO_MANAGEMENT_CACHE_VERSION).toBe(2);
+    });
+
     it("accepts the versioned cache and treats its regional catalog as authoritative", async () => {
       const fetchMock = vi.fn().mockResolvedValue({
         ok: true,
@@ -228,6 +262,62 @@ describe("Feature 2: Model Definitions", () => {
       expect(cachedModels.some((model) => model.id === "auto")).toBe(false);
       expect(resolveKiroModel("openai-gpt-5-6")).toBe("openai-gpt-5.6");
       expect(isCacheStale(TEST_REGION)).toBe(false);
+    });
+
+    it("repairs stale Luna image metadata in memory without rewriting the cache", () => {
+      const [cachedLuna] = mapKiroCatalogModels([{ modelId: "gpt-5.6-luna" }], TEST_REGION);
+      cachedLuna.input = ["text"];
+      const serialized = JSON.stringify({
+        version: KIRO_MANAGEMENT_CACHE_VERSION,
+        source: KIRO_MANAGEMENT_CACHE_SOURCE,
+        regions: {
+          [TEST_REGION]: {
+            region: TEST_REGION,
+            fetchedAt: Date.now(),
+            models: [cachedLuna],
+          },
+        },
+      });
+      writeFileSync(KIRO_MANAGEMENT_CACHE_PATH, serialized, "utf-8");
+
+      expect(getCachedModels(TEST_REGION)[0]?.input).toEqual(["text", "image"]);
+      expect(readFileSync(KIRO_MANAGEMENT_CACHE_PATH, "utf-8")).toBe(serialized);
+    });
+
+    it("reads the version 2 legacy home cache when the primary cache is absent", () => {
+      const legacyModels = mapKiroCatalogModels([{ modelId: "legacy-only" }], TEST_REGION);
+      writeFileSync(
+        LEGACY_HOME_CACHE_PATH,
+        JSON.stringify({
+          version: KIRO_MANAGEMENT_CACHE_VERSION,
+          source: KIRO_MANAGEMENT_CACHE_SOURCE,
+          regions: {
+            [TEST_REGION]: { region: TEST_REGION, fetchedAt: Date.now(), models: legacyModels },
+          },
+        }),
+        "utf-8",
+      );
+
+      expect(getCachedModels(TEST_REGION).map((model) => model.id)).toEqual(["legacy-only"]);
+      expect(resolveKiroModel("legacy-only")).toBe("legacy-only");
+      expect(isCacheStale(TEST_REGION)).toBe(false);
+    });
+
+    it("prefers the primary cache when both cache paths are valid", () => {
+      const legacyModels = mapKiroCatalogModels([{ modelId: "legacy-only" }], TEST_REGION);
+      const primaryModels = mapKiroCatalogModels([{ modelId: "primary-only" }], TEST_REGION);
+      const cacheWith = (models: KiroModel[]) =>
+        JSON.stringify({
+          version: KIRO_MANAGEMENT_CACHE_VERSION,
+          source: KIRO_MANAGEMENT_CACHE_SOURCE,
+          regions: {
+            [TEST_REGION]: { region: TEST_REGION, fetchedAt: Date.now(), models },
+          },
+        });
+      writeFileSync(LEGACY_HOME_CACHE_PATH, cacheWith(legacyModels), "utf-8");
+      writeFileSync(KIRO_MANAGEMENT_CACHE_PATH, cacheWith(primaryModels), "utf-8");
+
+      expect(getCachedModels(TEST_REGION).map((model) => model.id)).toEqual(["primary-only"]);
     });
 
     it("ignores both the old Q cache path and an unversioned cache at the management path", () => {
@@ -279,7 +369,7 @@ describe("Feature 2: Model Definitions", () => {
       expect(kiroModels.find((model) => model.id === "minimax-m2-1")?.reasoning).toBe(false);
     });
 
-    it("uses image input for Claude and text input for other concrete models", () => {
+    it("uses image input for Claude and text input for other concrete bootstrap models", () => {
       const claudeModels = kiroModels.filter((model) => model.id.startsWith("claude-"));
       const nonClaudeModels = kiroModels.filter((model) => !model.id.startsWith("claude-") && model.id !== "auto");
       expect(claudeModels.every((model) => model.input.includes("text") && model.input.includes("image"))).toBe(true);
@@ -330,6 +420,115 @@ describe("Feature 2: Model Definitions", () => {
       for (const model of kiroModels.filter((candidate) => !candidate.reasoning)) {
         expect(getSupportedThinkingLevels(model), `${model.id} supported levels`).toEqual(["off"]);
       }
+    });
+  });
+
+  describe("omp thinking config", () => {
+    const OPUS_SCHEMA = effortSchema("output_config", ["low", "medium", "high", "xhigh", "max"], true);
+
+    function validCache(models: unknown[], version: number = KIRO_MANAGEMENT_CACHE_VERSION): string {
+      return JSON.stringify({
+        version,
+        source: KIRO_MANAGEMENT_CACHE_SOURCE,
+        regions: { [TEST_REGION]: { region: TEST_REGION, fetchedAt: Date.now(), models } },
+      });
+    }
+
+    it("returns the full ladder and display capability from a catalog schema", () => {
+      expect(deriveThinkingConfig(deriveKiroEffort(OPUS_SCHEMA))).toEqual({
+        mode: "effort",
+        efforts: ["low", "medium", "high", "xhigh", "max"],
+        supportsDisplay: true,
+      });
+    });
+
+    it("returns undefined when no supported effort enum is present", () => {
+      expect(deriveThinkingConfig(deriveKiroEffort({ type: "object", properties: {} }))).toBeUndefined();
+      expect(deriveThinkingConfig({ field: "reasoning", values: [], summarizedThinking: false })).toBeUndefined();
+    });
+
+    it("filters values outside omp's effort enum", () => {
+      expect(
+        deriveThinkingConfig({
+          field: "reasoning",
+          values: ["none", "low", "turbo", "max"],
+          summarizedThinking: false,
+        }),
+      ).toEqual({
+        mode: "effort",
+        efforts: ["low", "max"],
+      });
+    });
+
+    it("orders efforts lowest-first regardless of schema order", () => {
+      expect(
+        deriveThinkingConfig({
+          field: "reasoning",
+          values: ["max", "low", "high"],
+          summarizedThinking: false,
+        })?.efforts,
+      ).toEqual(["low", "high", "max"]);
+    });
+
+    it("emits both thinking and thinkingLevelMap for a schema-bearing catalog model", () => {
+      const opus = mapKiroCatalogModels(catalogFixture, TEST_REGION).find((model) => model.id === "claude-opus-4-8");
+
+      expect(opus?.thinking).toEqual({
+        mode: "effort",
+        efforts: ["low", "medium", "high", "xhigh", "max"],
+        supportsDisplay: true,
+      });
+      expect(opus?.thinkingLevelMap).toEqual({ xhigh: "xhigh", max: "max" });
+    });
+
+    it("declares a ladder for every bootstrap model that maps xhigh or max", () => {
+      const laddered = kiroModels.filter((model) => model.thinkingLevelMap !== undefined);
+
+      expect(laddered.length).toBeGreaterThan(0);
+      expect(laddered.every((model) => (model.thinking?.efforts.length ?? 0) > 0)).toBe(true);
+      expect(kiroModels.every((model) => model.reasoning || model.thinking === undefined)).toBe(true);
+    });
+
+    it("uses the request fallback only when catalog schema is absent", () => {
+      const [schemaLess] = mapKiroCatalogModels([{ modelId: "claude-opus-4.8" }], TEST_REGION);
+      const [schemaWithoutEffort] = mapKiroCatalogModels(
+        [{ modelId: "claude-opus-4.8", additionalModelRequestFieldsSchema: { type: "object", properties: {} } }],
+        TEST_REGION,
+      );
+
+      expect(schemaLess.thinking?.efforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
+      expect(schemaWithoutEffort.thinking).toBeUndefined();
+    });
+
+    it("keeps a cached entry that carries a thinking config", () => {
+      const models = mapKiroCatalogModels(catalogFixture, TEST_REGION);
+      expect(models.some((model) => model.thinking !== undefined)).toBe(true);
+      writeFileSync(KIRO_MANAGEMENT_CACHE_PATH, validCache(models), "utf-8");
+
+      expect(getCachedModels(TEST_REGION).map((model) => model.id)).toEqual(models.map((model) => model.id));
+    });
+
+    it.each([
+      ["a non-effort mode", { mode: "budget", efforts: ["low"] }],
+      ["an empty effort list", { mode: "effort", efforts: [] }],
+      ["an effort outside the enum", { mode: "effort", efforts: ["turbo"] }],
+      ["a non-array effort list", { mode: "effort", efforts: "low" }],
+      ["a non-boolean display flag", { mode: "effort", efforts: ["low"], supportsDisplay: "yes" }],
+    ])("discards the whole cache when an entry has %s", (_label, thinking) => {
+      const [first, ...rest] = mapKiroCatalogModels(catalogFixture, TEST_REGION);
+      writeFileSync(KIRO_MANAGEMENT_CACHE_PATH, validCache([{ ...first, thinking }, ...rest]), "utf-8");
+
+      expect(getCachedModels(TEST_REGION)).toBe(kiroModels);
+    });
+
+    it("drops a v1 cache written before the thinking field existed", () => {
+      const models = mapKiroCatalogModels(catalogFixture, TEST_REGION).map(
+        ({ thinking: _thinking, ...model }) => model,
+      );
+      writeFileSync(KIRO_MANAGEMENT_CACHE_PATH, validCache(models, 1), "utf-8");
+
+      expect(getCachedModels(TEST_REGION)).toBe(kiroModels);
+      expect(isCacheStale(TEST_REGION)).toBe(true);
     });
   });
 });

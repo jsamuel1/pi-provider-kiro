@@ -6,7 +6,7 @@ A [pi](https://shittycodingagent.ai/) provider extension that connects pi to the
 
 Kiro gives you a strong free model menu, but pi needs a provider that speaks Kiro's auth, model catalog, and streaming protocol cleanly. `pi-provider-kiro` handles that bridge, including:
 
-- AWS Builder ID, IAM Identity Center, Google, and GitHub login flows
+- AWS Builder ID, IAM Identity Center, Google, GitHub, and enterprise external IdP (OIDC) login flows
 - shared credentials from an existing `kiro-cli` session when available
 - reasoning-aware streaming
 - region-aware model filtering so pi only shows models your Kiro region can actually use
@@ -36,6 +36,9 @@ The login flow supports:
 - **Your organization** — IAM Identity Center start URL
 - **Google** — social login via `kiro-cli`
 - **GitHub** — social login via `kiro-cli`
+
+If your organization uses an external identity provider (e.g. Okta) through Kiro, log in once with
+`kiro-cli login` and the provider reuses that session — no separate pi login needed.
 
 If you already use [kiro-cli](https://kiro.dev), the provider can reuse those credentials instead of forcing a second login.
 
@@ -82,6 +85,34 @@ This provider only keeps local recovery for Kiro-specific cases:
 - empty-stream retries
 - non-retryable Kiro body markers like `MONTHLY_REQUEST_COUNT` and `INSUFFICIENT_MODEL_CAPACITY`
 
+The reason codes this provider classifies on are published from the package
+entry point, so consumers can interpret a code without hardcoding their own copy
+of the literals:
+
+```ts
+import {
+  KIRO_REASON_CODES,
+  isCapacityError,
+  isNonRetryableBodyError,
+  isTooBigError,
+} from "pi-provider-kiro";
+
+isTooBigError(400, body); // size rejection → safe to compact and retry
+isCapacityError(body); // transient capacity → safe to retry as-is
+isNonRetryableBodyError(body); // hard quota → do not retry
+```
+
+These are Kiro's own codes, not a provider taxonomy: mapping them to your own
+semantics is the consumer's job.
+
+One caveat for consumers outside pi: the entry point is the whole provider, so
+importing it loads modules that import pi's host packages
+(`@earendil-works/pi-ai`, `-pi-coding-agent`, `-pi-tui`). They are declared as
+optional peer dependencies — present already wherever this runs as a pi
+extension, but a standalone project must install them itself or the import fails
+with `ERR_MODULE_NOT_FOUND`. The types resolve without them under the usual
+`skipLibCheck`.
+
 ## Development
 
 ```bash
@@ -104,6 +135,7 @@ src/
 ├── transform.ts        # Message format conversion
 ├── history.ts          # Conversation history management
 ├── thinking-parser.ts  # Streaming <thinking> tag parser
+├── token-type.ts       # `tokentype` header for external IdP bearer tokens
 ├── event-parser.ts     # Kiro stream event parser
 └── stream.ts           # Main streaming orchestrator
 ```
