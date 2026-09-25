@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Route IAM Identity Center sessions from `sa-east-1` to Kiro's `us-east-1` API region, avoiding catalog refresh requests to the unsupported `management.sa-east-1.kiro.dev` endpoint.
+
 ## [0.12.0] - 2026-09-22
 
 ### Added
