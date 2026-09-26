@@ -11,11 +11,13 @@ import type {
 import { isContextOverflow, isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { findJsonEnd } from "../src/bracket-tool-parser.js";
+import { resetCacheEstimatorForTests } from "../src/cache-estimator.js";
 import type { KiroUsageProvenance } from "../src/diagnostics.js";
 import { validateKiroConversation, validateKiroToolStructure } from "../src/history-validator.js";
 import { capacityRetryConfig, retryConfig } from "../src/retry.js";
-import { resetProfileArnCache, streamKiro } from "../src/stream.js";
+import { createKiroStream, resetProfileArnCache, streamKiro } from "../src/stream.js";
 import { EMPTY_CONTENT_PLACEHOLDER, type KiroHistoryEntry } from "../src/transform.js";
+import type { KiroUsageTracking } from "../src/usage-tracking.js";
 import {
   concatMessages,
   encodeEventMessage,
@@ -255,6 +257,14 @@ function mockFetchChunked(chunks: string[]) {
 }
 
 describe("Feature 9: Streaming Integration", () => {
+  const trackedStream = (usdPerCredit = 0.04) =>
+    createKiroStream({
+      estimateDollarValue: true,
+      usdPerCredit,
+      estimateCacheUsage: false,
+      estimatedCacheTimeout: 300_000,
+    } satisfies KiroUsageTracking);
+
   beforeEach(() => {
     // Mark profileArn as already resolved so tests don't see an extra fetch
     resetProfileArnCache(true);
@@ -769,6 +779,51 @@ describe("Feature 9: Streaming Integration", () => {
 
     expect(mockFetch.mock.calls[0][0]).toBe("https://management.eu-central-1.kiro.dev/List-Available-Profiles");
     expect(mockFetch.mock.calls[1][0]).toBe(`${endpoint}generateAssistantResponse`);
+    expect(events.find((event) => event.type === "done")).toBeDefined();
+
+    vi.unstubAllGlobals();
+  });
+
+  it("sends the runtime request to the resolved profile's region, not the SSO-derived region", async () => {
+    resetProfileArnCache(false);
+    // IAM Identity Center in us-east-1 with the Kiro profile in eu-central-1:
+    // ListAvailableProfiles is regional, so us-east-1 comes back empty and the
+    // profile is found in eu-central-1. The runtime call has to follow the
+    // profile, or Kiro rejects the cross-region ARN with "Improperly formed
+    // request.".
+    const testArn = "arn:aws:codewhisperer:eu-central-1:123:profile/TEST";
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ profiles: [] }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ profiles: [{ arn: testArn }] }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: vi
+              .fn()
+              .mockResolvedValueOnce({
+                done: false,
+                value: encodeBody('{"content":"Hi"}{"contextUsagePercentage":5}'),
+              })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            releaseLock: () => {},
+          }),
+        },
+      });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+
+    expect(mockFetch.mock.calls[0][0]).toBe("https://management.us-east-1.kiro.dev/List-Available-Profiles");
+    expect(mockFetch.mock.calls[1][0]).toBe("https://management.eu-central-1.kiro.dev/List-Available-Profiles");
+    expect(mockFetch.mock.calls[2][0]).toBe("https://runtime.eu-central-1.kiro.dev/generateAssistantResponse");
     expect(events.find((event) => event.type === "done")).toBeDefined();
 
     vi.unstubAllGlobals();
@@ -1502,6 +1557,39 @@ describe("Feature 9: Streaming Integration", () => {
     expect(currentMsg.content).toBe("");
     expect(currentMsg.userInputMessageContext?.toolResults).toHaveLength(1);
     expect(currentMsg.userInputMessageContext.toolResults[0].toolUseId).toBe("tc1");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("reads tools and system prompts from pi 0.86 transcript contexts", async () => {
+    const context = {
+      messages: [
+        {
+          role: "system" as const,
+          content: "TRANSCRIPT_SYSTEM_MARKER",
+          toolsAdded: [
+            {
+              name: "grep",
+              description: "Search file contents",
+              parameters: { type: "object", properties: { pattern: { type: "string" } } },
+            },
+          ],
+          timestamp: ts,
+        },
+        { role: "user" as const, content: "Find the marker", timestamp: ts },
+      ],
+    };
+    const mockFetch = mockFetchOk('{"content":"Searching."}{"contextUsagePercentage":3}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const current = body.conversationState.currentMessage.userInputMessage;
+    const tools = current.userInputMessageContext?.tools as Array<{ toolSpecification: { name: string } }> | undefined;
+    expect(current.content).toContain("TRANSCRIPT_SYSTEM_MARKER");
+    expect(tools?.map((tool) => tool.toolSpecification.name)).toContain("grep");
+    expect(body.conversationState.history ?? []).toHaveLength(0);
 
     vi.unstubAllGlobals();
   });
@@ -3096,6 +3184,30 @@ describe("Feature 9: Streaming Integration", () => {
   // First-token timeout (Task 1.2)
   // =========================================================================
 
+  it("clears the first-token timeout timer once the first token arrives (#154)", async () => {
+    vi.useFakeTimers();
+    const originalTimeout = retryConfig.firstTokenTimeoutMs;
+    // Long enough that the timer cannot fire mid-turn; the leak being tested
+    // is the *pending* handle surviving a completed happy-path request.
+    retryConfig.firstTokenTimeoutMs = 60_000;
+    const fetchMock = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":5}');
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "test" }));
+      expect(events.find((event) => event.type === "done")).toBeDefined();
+      // The losing timeout branch of the first-token race must not leave a
+      // ref'd timer pending: pre-fix, one firstTokenTimeout-class timer
+      // survived every completed turn and held the Node event loop open for
+      // up to 90 s in print mode (`pi -p`) and SDK embeds.
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      retryConfig.firstTokenTimeoutMs = originalTimeout;
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("retries when first token times out then succeeds on second attempt", async () => {
     const originalTimeout = retryConfig.firstTokenTimeoutMs;
     retryConfig.firstTokenTimeoutMs = 100;
@@ -3788,6 +3900,50 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
+  it("estimates repeated Kiro input as cache reads across one session", async () => {
+    resetCacheEstimatorForTests();
+    const estimateConfig: KiroUsageTracking = {
+      estimateDollarValue: false,
+      usdPerCredit: 0.04,
+      estimateCacheUsage: true,
+      estimatedCacheTimeout: 300_000,
+    };
+    const estimatedStream = createKiroStream(estimateConfig);
+
+    vi.stubGlobal(
+      "fetch",
+      mockFetchChunked([
+        '{"content":"First"}',
+        '{"tokenUsage":{"uncachedInputTokens":500,"outputTokens":200,"totalTokens":700}}',
+      ]),
+    );
+    const firstEvents = await collect(
+      estimatedStream(makeModel(), makeContext(), { apiKey: "tok", sessionId: "cache-estimate-session" }),
+    );
+    const first = firstEvents.find((event) => event.type === "done");
+    expect(first?.type === "done" && first.message.usage.cacheRead).toBe(0);
+
+    vi.stubGlobal(
+      "fetch",
+      mockFetchChunked([
+        '{"content":"Second"}',
+        '{"tokenUsage":{"uncachedInputTokens":900,"outputTokens":100,"totalTokens":1000}}',
+      ]),
+    );
+    const secondEvents = await collect(
+      estimatedStream(makeModel(), makeContext(), { apiKey: "tok", sessionId: "cache-estimate-session" }),
+    );
+    const second = secondEvents.find((event) => event.type === "done");
+    expect(second).toBeDefined();
+    if (second?.type !== "done") throw new Error("Expected a completed assistant message");
+    expect(second.message.usage.input).toBe(200);
+    expect(second.message.usage.cacheRead).toBe(700);
+    expect(second.message.usage.totalTokens).toBe(1000);
+    expect((second.message.usage as unknown as Record<string, unknown>).cacheEstimated).toBe(true);
+
+    vi.unstubAllGlobals();
+  });
+
   it("records cacheRead/cacheWrite so a cached turn is not priced as uncached input", async () => {
     // TokenUsage.uncachedInputTokens excludes cache reads. Taking `input` from
     // it while leaving cacheRead at 0 would report ~200 input tokens for a turn
@@ -3838,6 +3994,149 @@ describe("Feature 9: Streaming Integration", () => {
     expect(msg.usage.totalTokens).toBe(50250);
 
     vi.unstubAllGlobals();
+  });
+
+  it("converts valid metering credits to estimated USD-equivalent cost when enabled", async () => {
+    const frames = concatMessages(
+      encodeEventMessage({ content: "Hello" }),
+      encodeEventMessage({ usage: 3, unit: "credit", unitPlural: "credits" }, "meteringEvent"),
+    );
+    const mockFetch = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({ done: false, value: frames })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          releaseLock: () => {},
+        }),
+        cancel: async () => {},
+      },
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(trackedStream()(makeModel(), makeContext(), { apiKey: "tok" }));
+    const done = events.find((event) => event.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+
+    expect(msg?.usage.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.12 });
+  });
+
+  it("uses a custom USD-per-credit rate", async () => {
+    const frames = concatMessages(
+      encodeEventMessage({ content: "Hello" }),
+      encodeEventMessage({ usage: 2, unit: "credits" }, "meteringEvent"),
+    );
+    const mockFetch = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({ done: false, value: frames })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          releaseLock: () => {},
+        }),
+        cancel: async () => {},
+      },
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(trackedStream(0.025)(makeModel(), makeContext(), { apiKey: "tok" }));
+    const done = events.find((event) => event.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+
+    expect(msg?.usage.cost.total).toBe(0.05);
+  });
+
+  it.each([
+    ["missing unit", { usage: 3 }],
+    ["wrong unit", { usage: 3, unit: "token" }],
+    ["negative credits", { usage: -1, unit: "credit" }],
+    ["non-finite credits", { usage: null, unit: "credit" }],
+  ])("does not convert %s", async (_label, metering) => {
+    const frames = concatMessages(
+      encodeEventMessage({ content: "Hello" }),
+      encodeEventMessage(metering, "meteringEvent"),
+    );
+    const mockFetch = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({ done: false, value: frames })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          releaseLock: () => {},
+        }),
+        cancel: async () => {},
+      },
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(trackedStream()(makeModel(), makeContext(), { apiKey: "tok" }));
+    const done = events.find((event) => event.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+
+    expect(msg?.usage.cost.total).toBe(0);
+  });
+
+  it("converts zero credits to zero cost", async () => {
+    const frames = concatMessages(
+      encodeEventMessage({ content: "Hello" }),
+      encodeEventMessage({ usage: 0, unit: "CREDIT" }, "meteringEvent"),
+    );
+    const mockFetch = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({ done: false, value: frames })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          releaseLock: () => {},
+        }),
+        cancel: async () => {},
+      },
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(trackedStream()(makeModel(), makeContext(), { apiKey: "tok" }));
+    const done = events.find((event) => event.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+
+    expect(msg?.usage.cost.total).toBe(0);
+  });
+
+  it("does not carry metering from a discarded retry attempt", async () => {
+    const first = concatMessages(encodeEventMessage({ usage: 9, unit: "credit" }, "meteringEvent"));
+    const second = concatMessages(
+      encodeEventMessage({ content: "Hello" }),
+      encodeEventMessage({ usage: 2, unit: "credit" }, "meteringEvent"),
+    );
+    const response = (frames: Uint8Array) => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi
+            .fn()
+            .mockResolvedValueOnce({ done: false, value: frames })
+            .mockResolvedValueOnce({ done: true, value: undefined }),
+          releaseLock: () => {},
+        }),
+        cancel: async () => {},
+      },
+    });
+    const mockFetch = vi.fn().mockResolvedValueOnce(response(first)).mockResolvedValueOnce(response(second));
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(trackedStream()(makeModel(), makeContext(), { apiKey: "tok" }));
+    const done = events.find((event) => event.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+
+    expect(msg?.usage.cost.total).toBe(0.08);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 
   it("keeps metadataEvent token counts when a meteringEvent credit frame follows", async () => {
@@ -6087,6 +6386,54 @@ describe("turn provenance diagnostic", () => {
       output: "measured",
       totalTokens: "measured",
       cache: "measured",
+    } satisfies KiroUsageProvenance);
+  });
+
+  it("marks input and cache as estimated when the opt-in cache estimate moved tokens between them", async () => {
+    // The estimate runs only when the service reported neither cache leg, then
+    // moves repeated input into cacheRead. Recording the pre-estimate provenance
+    // would call a locally reduced `input` measured and leave `cache` absent
+    // ("never told") beside a non-zero cacheRead.
+    resetCacheEstimatorForTests();
+    const estimatedStream = createKiroStream({
+      estimateDollarValue: false,
+      usdPerCredit: 0.04,
+      estimateCacheUsage: true,
+      estimatedCacheTimeout: 300_000,
+    });
+    const turn = async (chunks: string[]) => {
+      vi.stubGlobal("fetch", mockFetchChunked(chunks));
+      const events = await collect(
+        estimatedStream(makeModel(), makeContext(), { apiKey: "tok", sessionId: "provenance-estimate-session" }),
+      );
+      vi.unstubAllGlobals();
+      const done = events.find((e) => e.type === "done");
+      return done?.type === "done" ? done.message : undefined;
+    };
+
+    const first = await turn([
+      '{"content":"First"}',
+      '{"tokenUsage":{"uncachedInputTokens":500,"outputTokens":200,"totalTokens":700}}',
+    ]);
+    // Nothing to estimate from on the first turn: the wire figures stand.
+    expect(first?.usage.cacheRead).toBe(0);
+    expect(provenanceOf(first).details?.usage).toEqual({
+      input: "measured",
+      output: "measured",
+      totalTokens: "measured",
+    } satisfies KiroUsageProvenance);
+
+    const second = await turn([
+      '{"content":"Second"}',
+      '{"tokenUsage":{"uncachedInputTokens":900,"outputTokens":100,"totalTokens":1000}}',
+    ]);
+    expect(second?.usage.input).toBe(200);
+    expect(second?.usage.cacheRead).toBe(700);
+    expect(provenanceOf(second).details?.usage).toEqual({
+      input: "estimated",
+      output: "measured",
+      totalTokens: "measured",
+      cache: "estimated",
     } satisfies KiroUsageProvenance);
   });
 

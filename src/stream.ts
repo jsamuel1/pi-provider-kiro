@@ -12,9 +12,11 @@ import type {
   Context,
   ImageContent,
   Model,
+  Message as PiMessage,
   SimpleStreamOptions,
   TextContent,
   ThinkingContent,
+  Tool,
   ToolCall,
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
@@ -22,6 +24,7 @@ import * as PiAi from "@earendil-works/pi-ai";
 import { UniversalEventStreamMarshaller } from "@smithy/core/event-streams";
 import type { Message } from "@smithy/types";
 import { parseBracketToolCalls } from "./bracket-tool-parser.js";
+import { applyCacheEstimate } from "./cache-estimator.js";
 import { debugEnabled, debugLog, formatSafeError, redactSensitiveText } from "./debug.js";
 import { createKiroTurnProvenanceDiagnostic, type KiroUsageProvenance } from "./diagnostics.js";
 import {
@@ -29,7 +32,7 @@ import {
   getKiroEffortConfig,
   type KiroAdditionalModelRequestFields,
 } from "./effort.js";
-import { getKiroEndpoints, getKiroRegionFromEndpoint } from "./endpoints.js";
+import { getKiroEndpoints, getKiroRegionFromEndpoint, getKiroRegionFromProfileArn } from "./endpoints.js";
 import { extractKiroReasonCode, KiroApiError, parseRetryAfterMs } from "./errors.js";
 import { type KiroErrorData, type KiroUsageData, parseKiroEvent, parseKiroExceptionFrame } from "./event-parser.js";
 import {
@@ -87,6 +90,7 @@ import {
   truncate,
 } from "./transform.js";
 import { TRUNCATION_NOTICE, wasPreviousResponseTruncated } from "./truncation.js";
+import { estimateKiroCreditCost, type KiroUsageTracking } from "./usage-tracking.js";
 
 const CAPACITY_LOG_DIR = join(homedir(), ".pi", "logs");
 const CAPACITY_LOG_FILE = join(CAPACITY_LOG_DIR, "capacity-retries.log");
@@ -389,11 +393,99 @@ function emitToolCall(
   return true;
 }
 
+interface TranscriptSystemMessage {
+  role: "system";
+  content: string | TextContent[];
+  sections?: Record<string, string | null>;
+  toolsAdded?: Tool[];
+  toolsRemoved?: Array<{ name: string }>;
+}
+
+type ProviderContext = Context | { messages: Array<PiMessage | TranscriptSystemMessage> };
+
+function transcriptContentText(content: string | TextContent[]): string {
+  if (typeof content === "string") return content;
+  return content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+}
+
+/**
+ * Resolve both legacy Context fields and pi 0.86+ transcript-backed prompt/tool state.
+ * Kiro carries the system prompt outside history, so system messages are collapsed
+ * and removed from the conversation passed to its user/assistant transformer.
+ */
+function resolveProviderContext(context: ProviderContext): {
+  messages: PiMessage[];
+  systemPrompt: string;
+  tools: Tool[];
+} {
+  const legacy = context as Context;
+  const promptParts = legacy.systemPrompt ? [legacy.systemPrompt] : [];
+  const sections = new Map<string, string>();
+  const tools = new Map((legacy.tools ?? []).map((tool) => [tool.name, tool]));
+  const messages: PiMessage[] = [];
+
+  for (const message of context.messages) {
+    if (message.role !== "system") {
+      messages.push(message as PiMessage);
+      continue;
+    }
+
+    const text = transcriptContentText(message.content);
+    if (text) promptParts.push(text);
+    for (const [name, value] of Object.entries(message.sections ?? {})) {
+      if (value === null) sections.delete(name);
+      else sections.set(name, value);
+    }
+    for (const tool of message.toolsRemoved ?? []) tools.delete(tool.name);
+    for (const tool of message.toolsAdded ?? []) tools.set(tool.name, tool);
+  }
+
+  return {
+    messages,
+    systemPrompt: [...promptParts, ...sections.values()].join("\n\n"),
+    tools: [...tools.values()],
+  };
+}
+
 export function streamKiro(
   model: Model<Api>,
-  context: Context,
+  context: ProviderContext,
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
+  return streamKiroWithUsageTracking(
+    {
+      estimateDollarValue: false,
+      usdPerCredit: 0,
+      estimateCacheUsage: false,
+      estimatedCacheTimeout: 300_000,
+    },
+    model,
+    context,
+    options,
+  );
+}
+
+export function createKiroStream(
+  usageTracking: KiroUsageTracking,
+): (model: Model<Api>, context: ProviderContext, options?: SimpleStreamOptions) => AssistantMessageEventStream {
+  return (model, context, options) => streamKiroWithUsageTracking(usageTracking, model, context, options);
+}
+
+function streamKiroWithUsageTracking(
+  usageTracking: KiroUsageTracking,
+  model: Model<Api>,
+  context: ProviderContext,
+  options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+  const {
+    messages: contextMessages,
+    tools: currentTools,
+    systemPrompt: currentSystemPrompt,
+  } = resolveProviderContext(context);
+
   // pi-ai's barrel re-exports the class as type-only before the runtime class re-export, so
   // a named import of AssistantMessageEventStream resolves to a type. Read it from the
   // namespace import to get the actual constructor. Replaces the removed
@@ -430,7 +522,6 @@ export function streamKiro(
         additionalModelRequestFieldsSchema?: Record<string, unknown>;
       };
       const region = modelMetadata.kiroRegion ?? getKiroRegionFromEndpoint(model.baseUrl) ?? "us-east-1";
-      const endpoint = new URL("generateAssistantResponse", getKiroEndpoints(region).runtime).toString();
       let managementAuth: KiroManagementAuth = { accessToken, region };
 
       const optionProfileArn =
@@ -463,12 +554,20 @@ export function streamKiro(
           (skipProfileResolutionForTests ? TEST_PROFILE_ARN : await resolveKiroProfileArn(managementAuth));
       }
 
+      // ListAvailableProfiles probes across regions (#104, #131), so an SSO login
+      // in one region can legitimately resolve a profile owned by another. The
+      // runtime host and the catalog have to follow the profile: sending a
+      // cross-region profile ARN to the runtime API fails the whole request with
+      // a generic `Improperly formed request.`.
+      let runtimeRegion = getKiroRegionFromProfileArn(profileArn) ?? region;
+      let endpoint = new URL("generateAssistantResponse", getKiroEndpoints(runtimeRegion).runtime).toString();
+
       // Trigger dynamic models cache update in the background if empty or stale
       const { isCacheStale, updateKiroModelsCache } = await import("./models.js");
-      if (!process.env.VITEST && isCacheStale(region)) {
-        updateKiroModelsCache(accessToken, region, profileArn).catch((error) => {
+      if (!process.env.VITEST && isCacheStale(runtimeRegion)) {
+        updateKiroModelsCache(accessToken, runtimeRegion, profileArn).catch((error) => {
           console.warn(
-            `[pi-provider-kiro] Failed to refresh Kiro model catalog in ${region}: ${formatSafeError(error)}`,
+            `[pi-provider-kiro] Failed to refresh Kiro model catalog in ${runtimeRegion}: ${formatSafeError(error)}`,
           );
         });
       }
@@ -488,13 +587,13 @@ export function streamKiro(
         contextWindow: model.contextWindow,
         thinkingEnabled,
         reasoning: options?.reasoning,
-        messageCount: context.messages.length,
-        toolCount: context.tools?.length ?? 0,
-        hasSystemPrompt: !!context.systemPrompt,
+        messageCount: contextMessages.length,
+        toolCount: currentTools.length,
+        hasSystemPrompt: !!currentSystemPrompt,
         profileArn,
         sessionId: options?.sessionId,
       });
-      let systemPrompt = context.systemPrompt ?? "";
+      let systemPrompt = currentSystemPrompt;
       // Kiro's runtime endpoint honors structured effort but only exposes Claude's
       // user-visible thinking stream when the legacy thinking markers are also
       // present. Keep both controls: structured fields select effort, while these
@@ -574,7 +673,7 @@ export function streamKiro(
         // pairs POSITIONALLY, so without this pass the displaced result's issuing
         // assistant is dropped and the real tool output is discarded. Pure
         // reorder — see `relocateDisplacedToolResults`.
-        const normalized = relocateDisplacedToolResults(normalizeMessages(context.messages));
+        const normalized = relocateDisplacedToolResults(normalizeMessages(contextMessages));
         const {
           history: rawHistory,
           systemPrepended,
@@ -690,16 +789,16 @@ export function streamKiro(
         // budget only after they have been appended.
         assertHistoryWithinLimit(history, dynamicHistoryLimit);
         // Prepend truncation notice if the previous assistant response was cut off
-        if (wasPreviousResponseTruncated(context.messages)) {
+        if (wasPreviousResponseTruncated(contextMessages)) {
           currentContent = currentContent === "" ? TRUNCATION_NOTICE : `${TRUNCATION_NOTICE}\n\n${currentContent}`;
         }
         // Always synthesize placeholder specs for tool names referenced in
-        // history, even when context.tools is empty/undefined. Without this,
+        // history, even when the current tools are empty/undefined. Without this,
         // an "advisor-style" call that inherits a tool-rich conversation but
         // declares no current tools is rejected by Kiro as "Improperly formed
         // request" because history references toolUses with no tool catalog.
         let uimc: { toolResults?: KiroToolResult[]; tools?: KiroToolSpec[] } | undefined;
-        const baseTools = context.tools?.length ? convertToolsToKiro(context.tools) : [];
+        const baseTools = currentTools.length ? convertToolsToKiro(currentTools) : [];
         const finalTools = history.length > 0 ? addPlaceholderTools(baseTools, history) : baseTools;
         if (currentToolResults.length > 0 || finalTools.length > 0) {
           uimc = {};
@@ -965,6 +1064,10 @@ export function streamKiro(
                 freshCreds?.profileArn ||
                 inheritedDesktopProfileArn ||
                 (skipProfileResolutionForTests ? TEST_PROFILE_ARN : await resolveKiroProfileArn(managementAuth));
+              // A replacement credential can carry a profile in another region,
+              // so re-pin the runtime host before retrying.
+              runtimeRegion = getKiroRegionFromProfileArn(profileArn) ?? region;
+              endpoint = new URL("generateAssistantResponse", getKiroEndpoints(runtimeRegion).runtime).toString();
               const delayMs = exponentialBackoff(retryCount - 1, 500, MAX_RETRY_DELAY);
               await abortableDelay(delayMs, options?.signal);
               break; // break inner loop, continue outer loop
@@ -1034,6 +1137,7 @@ export function streamKiro(
         let totalContent = "";
         let lastContentData = "";
         let usageEvent: KiroUsageData | null = null;
+        let meteringEvent: { credits?: number; unit?: string } | null = null;
         let receivedContextUsage = false;
         const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
         let nativeThinkingBlockIndex: number | null = null;
@@ -1167,21 +1271,33 @@ export function streamKiro(
           try {
             if (!gotFirstToken) {
               const readPromise = iterator.next();
-              const result = await Promise.race([
-                readPromise,
-                new Promise<typeof FIRST_TOKEN_SENTINEL>((resolve) =>
-                  setTimeout(() => resolve(FIRST_TOKEN_SENTINEL), firstTokenTimeoutForModel(model.id)),
-                ),
-              ]);
-              if (result === FIRST_TOKEN_SENTINEL) {
-                readPromise.catch(() => {}); // suppress dangling rejection
-                void bodyReader.cancel().catch(() => {});
-                firstTokenTimedOut = true;
-                break;
+              let firstTokenTimer: ReturnType<typeof setTimeout> | undefined;
+              try {
+                const result = await Promise.race([
+                  readPromise,
+                  new Promise<typeof FIRST_TOKEN_SENTINEL>((resolve) => {
+                    firstTokenTimer = setTimeout(
+                      () => resolve(FIRST_TOKEN_SENTINEL),
+                      firstTokenTimeoutForModel(model.id),
+                    );
+                  }),
+                ]);
+                if (result === FIRST_TOKEN_SENTINEL) {
+                  readPromise.catch(() => {}); // suppress dangling rejection
+                  void bodyReader.cancel().catch(() => {});
+                  firstTokenTimedOut = true;
+                  break;
+                }
+                iterResult = result as IteratorResult<Record<string, unknown>>;
+                gotFirstToken = true;
+                resetIdle();
+              } finally {
+                // The losing timeout branch of the race must not keep a ref'd
+                // timer alive until it fires: an uncleared 90 s handle holds
+                // the Node event loop open long after print-mode/SDK callers
+                // have finished their turn (#154).
+                if (firstTokenTimer !== undefined) clearTimeout(firstTokenTimer);
               }
-              iterResult = result as IteratorResult<Record<string, unknown>>;
-              gotFirstToken = true;
-              resetIdle();
             } else {
               iterResult = await iterator.next();
             }
@@ -1293,8 +1409,7 @@ export function streamKiro(
               break;
             }
             case "metering": {
-              // MeteringEvent.usage counts credits, not tokens. Recorded for
-              // observability only; never folded into token accounting.
+              meteringEvent = event.data;
               if (debugEnabled()) debugLog("stream.metering", [event.data]);
               break;
             }
@@ -1632,6 +1747,33 @@ export function streamKiro(
           // requires `!sawAnyToolCalls`. Kept so that loosening either predicate
           // appends rather than silently overwriting an exhaustion diagnostic.
           output.errorMessage = output.errorMessage ? `${output.errorMessage}. ${dropDiagnostic}` : dropDiagnostic;
+        }
+        if (!output.errorMessage) {
+          const estimatedRead = applyCacheEstimate(
+            conversationId,
+            output.usage,
+            usageEvent,
+            usageTracking,
+            output.timestamp,
+          );
+          if (estimatedRead > 0) {
+            // The estimate moved `estimatedRead` tokens out of `input` and into
+            // `cacheRead` with no wire basis (it only runs when the service
+            // reported neither cache leg). Both slots now carry an invented
+            // figure, so the provenance record below must not describe `input`
+            // as measured/derived or leave `cache` absent beside a non-zero
+            // `cacheRead`.
+            usageProvenance.input = "estimated";
+            usageProvenance.cache = "estimated";
+            debugLog("usage.estimate", {
+              conversationId,
+              estimatedRead,
+              input: output.usage.input,
+              cacheRead: output.usage.cacheRead,
+            });
+          }
+          const estimatedCost = estimateKiroCreditCost(usageTracking, meteringEvent);
+          if (estimatedCost !== undefined) output.usage.cost.total = estimatedCost;
         }
         // Record where this turn's numbers came from. The usage provenance and
         // the modeled stop reason are both invisible in the emitted message: the

@@ -23,7 +23,10 @@ export type KiroUsageSource = "measured" | "derived" | "estimated";
  * `0` left by the attempt reset stays distinguishable from a measured zero.
  * `cache` is absent whenever the turn reported neither cache field, so a genuine
  * 0% cache hit is distinguishable from "the provider never told us". Consumers
- * must render an absent slot as unknown, never as a measured zero.
+ * must render an absent slot as unknown, never as a measured zero. The one
+ * exception is the opt-in local cache estimate (`estimateCacheUsage`): when it
+ * moves tokens from `input` into `cacheRead`, both `input` and `cache` read
+ * `estimated`, because both figures are now local inventions.
  */
 export type KiroUsageProvenance = {
   input?: KiroUsageSource;

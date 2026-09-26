@@ -2,6 +2,7 @@
 // ABOUTME: Keeps management and runtime host selection independent from request URLs.
 
 const API_REGION_MAP: Record<string, string> = {
+  "sa-east-1": "us-east-1",
   "us-west-1": "us-east-1",
   "us-west-2": "us-east-1",
   "us-east-2": "us-east-1",
@@ -36,6 +37,19 @@ export function getKiroEndpoints(region: string): KiroEndpoints {
     management: `https://management.${region}.kiro.dev/`,
     runtime: `https://runtime.${region}.kiro.dev/`,
   };
+}
+
+/**
+ * A Kiro profile is owned by one region and its ARN carries that region. The
+ * runtime API rejects a profile ARN issued in another region with a generic
+ * `Improperly formed request.`, so runtime host selection has to follow the
+ * profile rather than the SSO-derived region: an Identity Center instance in
+ * us-east-1 can own a profile in eu-central-1.
+ */
+export function getKiroRegionFromProfileArn(profileArn: string | undefined): string | undefined {
+  if (!profileArn) return undefined;
+  const region = profileArn.split(":")[3];
+  return region && /^[a-z]{2}(?:-[a-z]+)+-\d$/.test(region) ? region : undefined;
 }
 
 export function getKiroRegionFromEndpoint(endpoint: string): string | undefined {
