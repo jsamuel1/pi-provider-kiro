@@ -49,9 +49,12 @@ export const KIRO_TURN_PROVENANCE_DIAGNOSTIC = "kiro_turn_provenance";
  * How the `stopReason` this provider emitted was arrived at.
  *
  * - `modeled` — `MetadataEvent.stopReason` arrived on the wire and the emitted
- *   value reflects it.
- * - `inferred` — reconstructed locally from emitted tool calls and whether a
- *   contextUsage event arrived. Usually right, but a guess.
+ *   value is its translation (see `mapModeledStopReason`).
+ * - `inferred` — this provider's own decision: no modeled value arrived, the
+ *   modeled member has no pi equivalent (CONTENT_FILTERED, PAUSE_TURN,
+ *   MODEL_CONTEXT_WINDOW_EXCEEDED, UNKNOWN), or an emitted tool call overruled
+ *   the wire (or a TOOL_USE whose calls were all dropped was overruled to
+ *   `"stop"`). Compare {@link KiroStopReasonRecord.modeled} to see which.
  */
 export type KiroStopReasonSource = "modeled" | "inferred";
 
@@ -176,9 +179,10 @@ export interface KiroTurnProvenanceInput {
    * How {@link stopReason} was produced, supplied by the code that produced it.
    *
    * Deliberately not inferred from {@link rawStopReason} being present: the
-   * service can send a modeled stop reason that the emitted value does not yet
-   * follow, and reading presence as authorship would report the emitted value
-   * as measured when it was still a local guess.
+   * service can send a modeled stop reason that the emitted value does not
+   * follow (an unmappable member, or a tool call that overrules it), and
+   * reading presence as authorship would report the emitted value as the
+   * service's statement when it was this provider's decision.
    */
   stopReasonSource: KiroStopReasonSource;
   /** `MetadataEvent.stopReason`, when one arrived. */

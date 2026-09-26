@@ -17,6 +17,7 @@ import { validateKiroConversation, validateKiroToolStructure } from "../src/hist
 import { capacityRetryConfig, retryConfig } from "../src/retry.js";
 import { createKiroStream, resetProfileArnCache, streamKiro } from "../src/stream.js";
 import { EMPTY_CONTENT_PLACEHOLDER, type KiroHistoryEntry } from "../src/transform.js";
+import { wasPreviousResponseTruncated } from "../src/truncation.js";
 import type { KiroUsageTracking } from "../src/usage-tracking.js";
 import {
   concatMessages,
@@ -6532,14 +6533,49 @@ describe("turn provenance diagnostic", () => {
     const { msg } = await run(['{"content":"Hello"}', '{"stopReason":"END_TURN"}', '{"contextUsagePercentage":10}']);
 
     expect(msg?.stopReason).toBe("stop");
-    expect(stopReasonOf(msg)).toEqual({ emitted: "stop", source: "inferred", modeled: "END_TURN" });
+    expect(stopReasonOf(msg)).toEqual({ emitted: "stop", source: "modeled", modeled: "END_TURN" });
   });
 
-  it("reports source as inferred while the emitted value is still reconstructed", async () => {
-    // The emitted stopReason comes from tool-call/contextUsage inference, not
-    // from the wire. Labelling it modeled would overstate what was measured.
+  it("reports source as modeled once the emitted value follows the wire", async () => {
+    // END_TURN has a faithful pi member, so the emitted value is the service's
+    // statement rather than a local reconstruction.
     const { msg } = await run(['{"content":"Hi"}', '{"stopReason":"END_TURN"}', '{"contextUsagePercentage":5}']);
-    expect(stopReasonOf(msg).source).toBe("inferred");
+    expect(stopReasonOf(msg).source).toBe("modeled");
+  });
+
+  it("reports source as modeled when TOOL_USE agrees with an emitted tool call", async () => {
+    const { msg } = await run([
+      '{"name":"read","toolUseId":"t1","input":"{\\"path\\":\\"/tmp/a\\"}","stop":true}',
+      '{"stopReason":"TOOL_USE"}',
+      '{"contextUsagePercentage":7}',
+    ]);
+    expect(msg?.stopReason).toBe("toolUse");
+    expect(stopReasonOf(msg)).toEqual({ emitted: "toolUse", source: "modeled", modeled: "TOOL_USE" });
+  });
+
+  it("reports source as inferred when an emitted tool call overrules a modeled END_TURN", async () => {
+    // The tool-call deltas are on the stream and cannot be retracted, so the
+    // emitted value is this provider's decision, not the wire's.
+    const { msg } = await run([
+      '{"name":"read","toolUseId":"t1","input":"{\\"path\\":\\"/tmp/a\\"}","stop":true}',
+      '{"stopReason":"END_TURN"}',
+      '{"contextUsagePercentage":7}',
+    ]);
+    expect(msg?.stopReason).toBe("toolUse");
+    expect(stopReasonOf(msg)).toEqual({ emitted: "toolUse", source: "inferred", modeled: "END_TURN" });
+  });
+
+  it("reports source as inferred for an unmappable member, even with MODEL_CONTEXT_WINDOW_EXCEEDED", async () => {
+    // "stop" here is this provider's fallback, not a translation: pi has no
+    // overflow member. The raw member and the overflow flag carry the truth.
+    const { msg } = await run(['{"content":"Partial"}', '{"stopReason":"MODEL_CONTEXT_WINDOW_EXCEEDED"}']);
+    expect(msg?.stopReason).toBe("stop");
+    expect(stopReasonOf(msg)).toEqual({
+      emitted: "stop",
+      source: "inferred",
+      modeled: "MODEL_CONTEXT_WINDOW_EXCEEDED",
+      contextOverflow: true,
+    });
   });
 
   it("flags MODEL_CONTEXT_WINDOW_EXCEEDED, which arrives on a successful turn", async () => {
@@ -6593,16 +6629,14 @@ describe("turn provenance diagnostic", () => {
     expect(stopReasonOf(msg).emitted).toBe("toolUse");
   });
 
-  it("exposes the emitted value contradicting the wire when no contextUsage frame arrives", async () => {
-    // receivedContextUsage only flips on a contextUsageEvent frame, so a
-    // metadataEvent-only stream makes the local branch emit "length" while the
-    // service plainly said END_TURN. This contradiction is the whole point of
-    // recording the modeled value: without it the fabricated "length" is
-    // indistinguishable from a real one.
+  it("follows the wire when no contextUsage frame arrives, instead of fabricating length", async () => {
+    // A metadataEvent alone settles the turn. Before the modeled value was
+    // consumed, this stream emitted "length" while the service plainly said
+    // END_TURN; the record now shows emitted and modeled agreeing.
     const { msg } = await run(['{"content":"Hi"}', '{"stopReason":"END_TURN"}']);
 
-    expect(msg?.stopReason).toBe("length");
-    expect(stopReasonOf(msg)).toEqual({ emitted: "length", source: "inferred", modeled: "END_TURN" });
+    expect(msg?.stopReason).toBe("stop");
+    expect(stopReasonOf(msg)).toEqual({ emitted: "stop", source: "modeled", modeled: "END_TURN" });
   });
 
   it("records a fabricated length with no modeled value to contradict it", async () => {
@@ -6616,19 +6650,17 @@ describe("turn provenance diagnostic", () => {
     expect("modeled" in stopReason).toBe(false);
   });
 
-  it("records MAX_TOKENS, which this provider emits as a natural completion", async () => {
-    // pi has a "length" member for truncation, but the emitted value never comes
-    // from the wire: with a contextUsage frame and no tool calls the branch emits
-    // "stop". So a truncated answer is indistinguishable from a finished one
-    // unless the consumer reads the modeled value.
+  it("records MAX_TOKENS as a modeled length", async () => {
+    // pi's "length" means exactly this, so the emitted value is now the
+    // service's own statement and a truncation is no longer swallowed as "stop".
     const { msg } = await run([
       '{"content":"A partial ans"}',
       '{"stopReason":"MAX_TOKENS"}',
       '{"contextUsagePercentage":42}',
     ]);
 
-    expect(msg?.stopReason).toBe("stop");
-    expect(stopReasonOf(msg)).toEqual({ emitted: "stop", source: "inferred", modeled: "MAX_TOKENS" });
+    expect(msg?.stopReason).toBe("length");
+    expect(stopReasonOf(msg)).toEqual({ emitted: "length", source: "modeled", modeled: "MAX_TOKENS" });
   });
 
   it("records UNKNOWN distinctly from no modeled stop reason arriving", async () => {
@@ -6844,5 +6876,170 @@ describe("turn provenance diagnostic", () => {
     expect((msg?.usage as unknown as Record<string, unknown>).contextPercent).toBe(12);
     // Only the diagnostic is lost.
     expect(msg?.diagnostics ?? []).toEqual([]);
+  });
+});
+
+describe("modeled stopReason consumption", () => {
+  beforeEach(() => {
+    resetProfileArnCache(true);
+  });
+
+  async function run(chunks: string[]) {
+    const mockFetch = mockFetchChunked(chunks);
+    vi.stubGlobal("fetch", mockFetch);
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+    vi.unstubAllGlobals();
+    const done = events.find((e) => e.type === "done");
+    const error = events.find((e) => e.type === "error");
+    return {
+      msg: done?.type === "done" ? done.message : error?.type === "error" ? error.error : undefined,
+      terminal: done ? "done" : "error",
+      doneReason: done?.type === "done" ? done.reason : undefined,
+    };
+  }
+
+  const TOOL_CALL = '{"name":"read","toolUseId":"t1","input":"{\\"path\\":\\"/tmp/a\\"}","stop":true}';
+
+  it("emits stop for END_TURN once a contextUsage frame has arrived", async () => {
+    const { msg, doneReason } = await run([
+      '{"content":"Hello"}',
+      '{"stopReason":"END_TURN"}',
+      '{"contextUsagePercentage":10}',
+    ]);
+    expect(msg?.stopReason).toBe("stop");
+    expect(doneReason).toBe("stop");
+  });
+
+  it("emits stop, not length, for END_TURN when no contextUsage frame arrives", async () => {
+    // The metadataEvent alone settles the turn. Before the modeled value was
+    // consumed, only a contextUsageEvent flipped the settled flag, so this
+    // stream emitted "length" while the service plainly said END_TURN — a
+    // fabricated truncation that made wasPreviousResponseTruncated() prepend
+    // TRUNCATION_NOTICE to the next turn.
+    const { msg, doneReason } = await run(['{"content":"Hi"}', '{"stopReason":"END_TURN"}']);
+
+    expect(msg?.stopReason).toBe("stop");
+    expect(doneReason).toBe("stop");
+    expect(wasPreviousResponseTruncated([msg as AssistantMessage])).toBe(false);
+  });
+
+  it("emits length for MAX_TOKENS so the truncated answer can be continued", async () => {
+    // pi's "length" means exactly this, and it is what makes
+    // wasPreviousResponseTruncated() offer the continuation the turn needs.
+    // Before the modeled value was consumed, a contextUsage frame with no tool
+    // calls emitted "stop" and the truncation was silently swallowed.
+    const { msg, terminal, doneReason } = await run([
+      '{"content":"A partial ans"}',
+      '{"stopReason":"MAX_TOKENS"}',
+      '{"contextUsagePercentage":42}',
+    ]);
+
+    expect(msg?.stopReason).toBe("length");
+    // The terminal event carries it too. A done event's `reason` admits
+    // "length", so a modeled truncation must reach the caller as one there as
+    // well rather than being flattened into a stop by the push site.
+    expect(terminal).toBe("done");
+    expect(doneReason).toBe("length");
+    expect(wasPreviousResponseTruncated([msg as AssistantMessage])).toBe(true);
+  });
+
+  it("still emits length when nothing at all says the turn settled", async () => {
+    // No metadataEvent and no contextUsageEvent: the local reconstruction still
+    // calls it truncated. This is the only remaining path to "length" without
+    // the service asking for it.
+    const { msg } = await run(['{"content":"Hi"}']);
+    expect(msg?.stopReason).toBe("length");
+  });
+
+  it("emits toolUse when TOOL_USE agrees with an emitted tool call", async () => {
+    const { msg, doneReason } = await run([TOOL_CALL, '{"stopReason":"TOOL_USE"}', '{"contextUsagePercentage":7}']);
+    expect(msg?.stopReason).toBe("toolUse");
+    expect(doneReason).toBe("toolUse");
+  });
+
+  it("keeps toolUse over a modeled END_TURN when a tool call was already emitted", async () => {
+    // The tool-call deltas are on the stream and cannot be retracted, so the
+    // caller has to be told to run them whatever the service called the stop.
+    const { msg } = await run([TOOL_CALL, '{"stopReason":"END_TURN"}', '{"contextUsagePercentage":7}']);
+
+    expect(msg?.stopReason).toBe("toolUse");
+    expect(msg?.content.filter((b) => b.type === "toolCall")).toHaveLength(1);
+  });
+
+  it("keeps toolUse over a modeled MAX_TOKENS when a tool call was already emitted", async () => {
+    // Same rule for the truncation member: an emitted tool call is a demand for
+    // results, and "length" would leave pi never running it.
+    const { msg } = await run([TOOL_CALL, '{"stopReason":"MAX_TOKENS"}', '{"contextUsagePercentage":7}']);
+    expect(msg?.stopReason).toBe("toolUse");
+  });
+
+  it("emits stop, not toolUse, for TOOL_USE when every tool call was dropped", async () => {
+    // The service says TOOL_USE and every tool call it sent was dropped for
+    // unparseable input, so nothing was emitted. Emitting "toolUse" with no
+    // tool call on the message stalls pi's agent loop, so the wire is overruled.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { msg } = await run([
+      '{"name":"bash","toolUseId":"tc1","input":"not-json","stop":true}',
+      '{"stopReason":"TOOL_USE"}',
+      '{"contextUsagePercentage":10}',
+    ]);
+    warnSpy.mockRestore();
+
+    expect(msg?.stopReason).toBe("stop");
+    expect(msg?.content.filter((b) => b.type === "toolCall")).toHaveLength(0);
+  });
+
+  it("emits stop for CONTENT_FILTERED even with no contextUsage frame", async () => {
+    // A refusal has no faithful pi member, so the emitted value is a local
+    // decision — but the metadataEvent still proves the turn settled, so it must
+    // not fall through to a fabricated "length" and ask the model to continue.
+    const { msg, terminal } = await run([
+      '{"content":"I can\'t help with that."}',
+      '{"stopReason":"CONTENT_FILTERED","stopDetails":{"refusal":{"category":"CYBER"}}}',
+    ]);
+
+    expect(terminal).toBe("done");
+    expect(msg?.stopReason).toBe("stop");
+    expect(msg?.errorMessage).toBeUndefined();
+    expect(wasPreviousResponseTruncated([msg as AssistantMessage])).toBe(false);
+  });
+
+  it("emits stop for MODEL_CONTEXT_WINDOW_EXCEEDED rather than inviting a continuation", async () => {
+    // "length" would make wasPreviousResponseTruncated() send the same
+    // already-overflowing context back with a continuation notice, so the next
+    // turn overflows again and the loop does not converge.
+    const { msg, terminal } = await run(['{"content":"Partial"}', '{"stopReason":"MODEL_CONTEXT_WINDOW_EXCEEDED"}']);
+
+    expect(terminal).toBe("done");
+    expect(msg?.stopReason).toBe("stop");
+    expect(wasPreviousResponseTruncated([msg as AssistantMessage])).toBe(false);
+  });
+
+  it("emits stop for PAUSE_TURN and UNKNOWN, which have no member at this peer", async () => {
+    for (const raw of ["PAUSE_TURN", "UNKNOWN"]) {
+      const { msg } = await run(['{"content":"Hi"}', `{"stopReason":"${raw}"}`]);
+      expect(msg?.stopReason).toBe("stop");
+    }
+  });
+
+  it("uses the stop reason from the attempt that completed, not a discarded one", async () => {
+    // usageEvent is per-attempt. A MAX_TOKENS from an attempt that was retried
+    // as degenerate must not turn the successful attempt into a truncation.
+    const first = mockFetchChunked(['{"stopReason":"MAX_TOKENS"}']);
+    const second = mockFetchChunked(['{"content":"Recovered"}', '{"stopReason":"END_TURN"}']);
+    const mockFetch = vi
+      .fn()
+      .mockImplementationOnce(() => first())
+      .mockImplementationOnce(() => second());
+    vi.stubGlobal("fetch", mockFetch);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+    const done = events.find((e) => e.type === "done");
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(done?.type === "done" && done.message.stopReason).toBe("stop");
   });
 });
