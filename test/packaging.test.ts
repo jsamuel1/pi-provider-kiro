@@ -12,6 +12,8 @@ const pkg = JSON.parse(readFileSync(`${repoRoot}package.json`, "utf8")) as {
   types?: string;
   files?: string[];
   scripts: Record<string, string>;
+  dependencies?: Record<string, string>;
+  devDependencies?: Record<string, string>;
   peerDependencies?: Record<string, string>;
   peerDependenciesMeta?: Record<string, { optional?: boolean }>;
   pi?: { extensions?: string[] };
@@ -96,6 +98,15 @@ describe("published package surface", () => {
       expect(pkg.peerDependencies ?? {}, `${specifier} is imported but not declared`).toHaveProperty(specifier);
       expect(pkg.peerDependenciesMeta?.[specifier]?.optional).toBe(true);
     }
+  });
+
+  // esbuild only produces dist/index.js; nothing in src/ or the bundle imports
+  // it. As a runtime dependency every consumer installed a full esbuild plus its
+  // platform binary beside whatever esbuild its own tree already carried.
+  it("keeps the bundler out of the runtime dependency set", () => {
+    expect(pkg.dependencies ?? {}).not.toHaveProperty("esbuild");
+    expect(pkg.devDependencies?.esbuild).toMatch(/^0\.28\.\d+$/);
+    expect(pkg.scripts.build).toMatch(/^esbuild /);
   });
 
   it("keeps pi's packages external so the host's own copy is used", () => {
