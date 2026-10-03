@@ -75,6 +75,8 @@ import { mapModeledStopReason } from "./stop-reason.js";
 import { ThinkingTagParser } from "./thinking-parser.js";
 import { kiroTokenTypeHeaders } from "./token-type.js";
 import { countTokens } from "./tokenizer.js";
+import { normalizeToolName } from "./tool-name-aliases.js";
+import { parseToolUseCalls } from "./tool-use-parser.js";
 import {
   buildHistory,
   convertImagesToKiro,
@@ -96,6 +98,37 @@ import {
 } from "./transform.js";
 import { TRUNCATION_NOTICE, wasPreviousResponseTruncated } from "./truncation.js";
 import { estimateKiroCreditCost, type KiroUsageTracking } from "./usage-tracking.js";
+
+/** Minimal structural view of a refreshed Kiro credential handed to the host's
+ *  accessor. A superset lives in `oauth.ts` (`KiroCredentials`); this pins only
+ *  what write-back reads so the accessor contract does not couple to that type. */
+export interface KiroCredentialLike {
+  access: string;
+  expires?: number;
+  region?: string;
+  profileArn?: string;
+  authMethod?: string;
+}
+
+/** Optional host-owned credential accessor, passed on stream options. `get`
+ *  seeds each call from the freshest token the host holds; `set` receives a
+ *  credential the provider refreshed mid-call so it survives the call (and, via
+ *  the host's persistence, later calls/processes). `ensureFresh` is awaited
+ *  before the token is read, so a host that knows the expiry can refresh ahead
+ *  of it instead of waiting for a 403. All are optional and best-effort — the
+ *  provider falls back to the static `apiKey` and never lets an accessor
+ *  failure fail the turn. */
+export interface KiroCredentialAccessor {
+  get?: () => string | undefined;
+  set?: (creds: KiroCredentialLike) => void;
+  ensureFresh?: () => Promise<void>;
+}
+
+/** streamKiro options: the shared `SimpleStreamOptions` plus Kiro's optional
+ *  host credential accessor, so typed consumers can pass it without a cast. */
+export interface KiroStreamOptions extends SimpleStreamOptions {
+  credentialAccessor?: KiroCredentialAccessor;
+}
 
 const CAPACITY_LOG_DIR = join(homedir(), ".pi", "logs");
 const CAPACITY_LOG_FILE = join(CAPACITY_LOG_DIR, "capacity-retries.log");
@@ -390,7 +423,12 @@ function emitToolCall(
   }
 
   const contentIndex = output.content.length;
-  const toolCall: ToolCall = { type: "toolCall", id: state.toolUseId, name: state.name, arguments: args };
+  const toolCall: ToolCall = {
+    type: "toolCall",
+    id: state.toolUseId,
+    name: normalizeToolName(state.name),
+    arguments: args,
+  };
   output.content.push(toolCall);
   stream.push({ type: "toolcall_start", contentIndex, partial: output });
   stream.push({ type: "toolcall_delta", contentIndex, delta: state.input, partial: output });
@@ -458,7 +496,7 @@ function resolveProviderContext(context: ProviderContext): {
 export function streamKiro(
   model: Model<Api>,
   context: ProviderContext,
-  options?: SimpleStreamOptions,
+  options?: KiroStreamOptions,
 ): AssistantMessageEventStream {
   return streamKiroWithUsageTracking(
     {
@@ -475,7 +513,7 @@ export function streamKiro(
 
 export function createKiroStream(
   usageTracking: KiroUsageTracking,
-): (model: Model<Api>, context: ProviderContext, options?: SimpleStreamOptions) => AssistantMessageEventStream {
+): (model: Model<Api>, context: ProviderContext, options?: KiroStreamOptions) => AssistantMessageEventStream {
   return (model, context, options) => streamKiroWithUsageTracking(usageTracking, model, context, options);
 }
 
@@ -483,7 +521,7 @@ function streamKiroWithUsageTracking(
   usageTracking: KiroUsageTracking,
   model: Model<Api>,
   context: ProviderContext,
-  options?: SimpleStreamOptions,
+  options?: KiroStreamOptions,
 ): AssistantMessageEventStream {
   const {
     messages: contextMessages,
@@ -516,15 +554,48 @@ function streamKiroWithUsageTracking(
       stopReason: "stop",
       timestamp: Date.now(),
     };
+    // Refresh decisions/outcomes for THIS call. Declared outside the try so the
+    // terminal catch can surface it: it makes "the 3 retries failed" decidable
+    // (refresh returned nothing vs. the refreshed token was itself rejected)
+    // instead of invisible on the child's stderr.
+    const refreshTrace: string[] = [];
     try {
-      const initialAccessToken = options?.apiKey;
-      if (!initialAccessToken) throw new Error("Kiro credentials not set. Run /login kiro or install kiro-cli.");
-      let accessToken: string = initialAccessToken;
+      // Credential accessor (optional): a mutable getter/setter the host owns so a
+      // token refreshed mid-call survives the call. Seeded from the accessor when
+      // present, else the static apiKey. Written back after any successful refresh
+      // so the NEXT call — and, via the host's persistence, sibling processes and
+      // later sessions — start from the fresh token instead of paying another 403.
+      // Structural, not nominal: the host passes a plain object, we never import
+      // its type. `set` is best-effort and must never throw into the turn.
+      const credentialAccessor = options?.credentialAccessor;
+      // Proactive refresh: let the host rotate a token it knows is about to
+      // expire before we read it. The reactive 403 retry below stays as the
+      // safety net, so a failed ensureFresh is swallowed, not fatal.
+      try {
+        await credentialAccessor?.ensureFresh?.();
+      } catch {
+        // best-effort — fall through to whatever token the host holds.
+      }
+      const seededToken = credentialAccessor?.get?.() || options?.apiKey;
+      if (!seededToken) throw new Error("Kiro credentials not set. Run /login kiro or install kiro-cli.");
+      let accessToken: string = seededToken;
+      // Persist a refreshed credential back to the host, once, only when the token
+      // actually changed. Never throws: a classification/persist failure must not
+      // fail a turn the refresh just rescued.
+      const writeBackCredential = (creds: KiroCredentialLike, previousToken: string): void => {
+        try {
+          if (!creds?.access || creds.access === previousToken) return;
+          credentialAccessor?.set?.(creds);
+        } catch {
+          // best-effort — the host's persistence is not load-bearing for this turn.
+        }
+      };
       const modelMetadata = model as Model<Api> & {
         kiroModelId?: string;
         kiroRegion?: string;
         kiroProfileArn?: string;
         additionalModelRequestFieldsSchema?: Record<string, unknown>;
+        recoverTextToolCalls?: boolean;
       };
       const region = modelMetadata.kiroRegion ?? getKiroRegionFromEndpoint(model.baseUrl) ?? "us-east-1";
       let managementAuth: KiroManagementAuth = { accessToken, region };
@@ -547,12 +618,27 @@ function streamKiroWithUsageTracking(
         // Re-read the shared store first, then force a refresh only when it still
         // contains the rejected token. Profile discovery must succeed before the
         // runtime request can be constructed.
+        const rejectedToken = accessToken;
         const storedCreds = getKiroCliCredentials();
-        const freshCreds =
-          storedCreds?.access && storedCreds.access !== accessToken ? storedCreds : refreshViaKiroCli();
-        if (!freshCreds?.access) throw error;
+        const forcedRefresh = !(storedCreds?.access && storedCreds.access !== accessToken);
+        const freshCreds = forcedRefresh ? refreshViaKiroCli() : storedCreds;
+        if (!freshCreds?.access) {
+          refreshTrace.push(
+            forcedRefresh ? "profile-403: refresh returned no token" : "profile-403: store had no fresh token",
+          );
+          throw error;
+        }
+        refreshTrace.push(
+          freshCreds.access === rejectedToken
+            ? "profile-403: refreshed token identical (entitlement?)"
+            : forcedRefresh
+              ? "profile-403: refreshed via kiro-cli"
+              : "profile-403: adopted token from store",
+        );
 
         accessToken = freshCreds.access;
+        // Hand the refreshed credential back to the host so it survives the call.
+        writeBackCredential(freshCreds, rejectedToken);
         managementAuth = { accessToken, region };
         profileArn =
           freshCreds.profileArn ||
@@ -1055,7 +1141,20 @@ function streamKiroWithUsageTracking(
                     : undefined;
               const freshCreds: ReturnType<typeof getKiroCliCredentials> =
                 storedCreds?.access && storedCreds.access !== rejectedAccessToken ? storedCreds : refreshViaKiroCli();
+              const forcedRefresh = !(storedCreds?.access && storedCreds.access !== rejectedAccessToken);
               if (freshCreds?.access) accessToken = freshCreds.access;
+              refreshTrace.push(
+                !freshCreds?.access
+                  ? `runtime-403 #${retryCount}: ${forcedRefresh ? "refresh returned no token" : "store had no fresh token"}`
+                  : freshCreds.access === rejectedAccessToken
+                    ? `runtime-403 #${retryCount}: refreshed token identical (entitlement?)`
+                    : forcedRefresh
+                      ? `runtime-403 #${retryCount}: refreshed via kiro-cli`
+                      : `runtime-403 #${retryCount}: adopted token from store`,
+              );
+              // Hand the refreshed credential back to the host so it survives the
+              // call. Guarded on a genuine change inside writeBackCredential.
+              if (freshCreds?.access) writeBackCredential(freshCreds, rejectedAccessToken);
               managementAuth = { accessToken, region };
 
               // Social profiles may not be discoverable through management.
@@ -1140,7 +1239,6 @@ function streamKiroWithUsageTracking(
         if (callerSignal?.aborted) onCallerStreamAbort();
         else callerSignal?.addEventListener("abort", onCallerStreamAbort, { once: true });
         let totalContent = "";
-        let lastContentData = "";
         let usageEvent: KiroUsageData | null = null;
         let meteringEvent: { credits?: number; unit?: string } | null = null;
         // True once a frame arrived that says the turn reached a settled state
@@ -1374,9 +1472,8 @@ function streamKiroWithUsageTracking(
               break;
             }
             case "content": {
+              if (event.data === "") break;
               endNativeThinking();
-              if (event.data === lastContentData) continue;
-              lastContentData = event.data;
               totalContent += event.data;
               if (thinkingParser) {
                 thinkingParser.processChunk(event.data);
@@ -1419,6 +1516,12 @@ function streamKiroWithUsageTracking(
               const prev: KiroUsageData = usageEvent ?? {};
               usageEvent = { ...prev, ...event.data };
               sawSettlingFrame = true;
+              // The service can also report context usage inside metadataEvent.
+              // `sawSettlingFrame` above already covers the settled-turn signal
+              // main's `receivedContextUsage` carried here.
+              if (event.data.contextUsagePercentage !== undefined) {
+                (output.usage as unknown as Record<string, unknown>).contextPercent = event.data.contextUsagePercentage;
+              }
               break;
             }
             case "metering": {
@@ -1486,21 +1589,20 @@ function streamKiroWithUsageTracking(
           textBlockIndex = thinkingParser.getTextBlockIndex();
         }
         // Fallback: extract text-dialect tool calls from content if no native
-        // tool calls arrived. Two dialects are recovered at this seam:
+        // tool calls arrived. Three dialects are recovered at this seam:
         //   1. Kiro's own `[Called name with args: {...}]` bracket form.
         //   2. Anthropic's `<invoke name="..."><parameter .../></invoke>` XML
         //      form, which opus-class models emit as plain text at high context.
+        //   3. The `<tool_use>{JSON}</tool_use>` form, another shape opus-class
+        //      models fall back to (JSON descriptor with tool_name/tool_input,
+        //      name/input, or name/arguments field spellings).
         // Without this, the turn ends `stopReason:"stop"` with zero tool calls —
         // the agent loop sees a finished answer and an unattended session stalls
         // indefinitely with no error recorded anywhere.
         //
-        // Deliberately still gated on `sawAnyToolCalls`, so it does NOT run when a
-        // native call arrived and was dropped for unparseable arguments. Widening it
-        // to `emittedToolCalls === 0` would enable text recovery on exactly the path
-        // where `KiroModel.recoverTextToolCalls === false` says not to (Claude), and
-        // that flag is not consumed here yet — so the widening cannot be made
-        // model-aware without first wiring it. The drop is reported instead.
-        if (!sawAnyToolCalls && textBlockIndex !== null) {
+        // Never reinterpret text for models that opt out, including Claude.
+        // Native malformed tool calls remain errors rather than triggering recovery.
+        if (modelMetadata.recoverTextToolCalls !== false && !sawAnyToolCalls && textBlockIndex !== null) {
           const textBlock = output.content[textBlockIndex] as TextContent;
           const recovered: Array<{ toolUseId: string; name: string; arguments: Record<string, unknown> }> = [];
           const bracketResult = parseBracketToolCalls(textBlock.text);
@@ -1512,6 +1614,11 @@ function streamKiroWithUsageTracking(
           if (invokeResult.toolCalls.length > 0) {
             textBlock.text = invokeResult.cleanedText;
             recovered.push(...invokeResult.toolCalls);
+          }
+          const toolUseResult = parseToolUseCalls(textBlock.text);
+          if (toolUseResult.toolCalls.length > 0) {
+            textBlock.text = toolUseResult.cleanedText;
+            recovered.push(...toolUseResult.toolCalls);
           }
           if (recovered.length > 0) {
             sawAnyToolCalls = true;
@@ -1647,8 +1754,10 @@ function streamKiroWithUsageTracking(
         const hasText = textBlockIndex !== null && (output.content[textBlockIndex] as TextContent).text.length > 0;
         const responseText = hasText ? (output.content[textBlockIndex as number] as TextContent).text : "";
         const isEchoLoop = hasText && !sawAnyToolCalls && /^\s*(continue|\.+)\s*$/i.test(responseText);
-        const degenerate = (!hasText && !sawAnyToolCalls) || isEchoLoop;
-        if (isEchoLoop) echoAttempts++;
+        // Explicit completion/refusal metadata is authoritative, including empty turns.
+        const explicitStop = usageEvent?.rawStopReason;
+        const degenerate = !explicitStop && ((!hasText && !sawAnyToolCalls) || isEchoLoop);
+        if (degenerate && isEchoLoop) echoAttempts++;
         else if (degenerate) emptyAttempts++;
         const exhausted = degenerate && retryCount >= maxRetries;
         // Use emittedToolCalls (not toolCalls.length) to avoid stopReason:"toolUse"
@@ -1887,7 +1996,16 @@ function streamKiroWithUsageTracking(
           }),
         );
       }
-      debugLog("response.caught", { stopReason: output.stopReason, error: output.errorMessage });
+      // For a host that owns credentials (it passed an accessor), surface this
+      // call's refresh decisions/outcomes onto the terminal error so an auth
+      // failure is decidable in the transcript. Appended on its own line so a
+      // line-oriented classifier still matches the original error grammar on the
+      // first line. Without an accessor the message is unchanged. Never on an
+      // abort — an aborted turn's refresh history is noise.
+      if (options?.credentialAccessor && output.stopReason !== "aborted" && refreshTrace.length > 0) {
+        output.errorMessage = `${output.errorMessage}\n[auth-refresh] ${refreshTrace.join("; ")}`;
+      }
+      debugLog("response.caught", { stopReason: output.stopReason, error: output.errorMessage, refreshTrace });
       stream.push({ type: "error", reason: output.stopReason, error: output });
       stream.end();
     }

@@ -71,6 +71,7 @@ export {
   TOO_BIG_PATTERNS,
 } from "./retry.js";
 export { mapModeledStopReason } from "./stop-reason.js";
+export type { KiroCredentialAccessor, KiroCredentialLike, KiroStreamOptions } from "./stream.js";
 export { streamKiro } from "./stream.js";
 export {
   EMPTY_CONTENT_PLACEHOLDER,
