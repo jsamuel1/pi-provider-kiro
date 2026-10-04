@@ -13,8 +13,31 @@ import type { AssistantMessageDiagnostic } from "@earendil-works/pi-ai";
  * - `estimated` — invented locally with no wire basis: a tiktoken pass over the
  *   emitted content for `output`, or a sum that includes such an estimate for
  *   `totalTokens`.
+ * - `declared` — a floor this provider wrote because the service DECLARED the
+ *   context window exceeded (`MODEL_CONTEXT_WINDOW_EXCEEDED` on a successful
+ *   turn). The figure is raised to `contextWindow + 1` so pi's
+ *   `isContextOverflow()` sees the overflow the service stated; it is a lower
+ *   bound, never a count. See {@link KIRO_CONTEXT_OVERFLOW_DECLARED_USAGE_KEY}.
  */
-export type KiroUsageSource = "measured" | "derived" | "estimated";
+export type KiroUsageSource = "measured" | "derived" | "estimated" | "declared";
+
+/**
+ * Non-pi key set to `true` on `AssistantMessage.usage` (beside `contextPercent`)
+ * when the service declared `MODEL_CONTEXT_WINDOW_EXCEEDED` and the turn was
+ * emitted as `"stop"`.
+ *
+ * pi's only path that compacts a *successful* turn is `isContextOverflow()`'s
+ * silent-overflow case: `stopReason === "stop"` and
+ * `usage.input + usage.cacheRead > contextWindow`, strictly. This provider
+ * derives `input` from `contextUsagePercentage`, which is at most 100% of the
+ * window, and the service never reports `cacheRead` — so a declared overflow
+ * could never satisfy it and the truncated answer was kept with no compaction.
+ * `streamKiro` therefore raises `input` to the smallest value that trips the
+ * check, and sets this key so a consumer reading `usage` alone can tell that
+ * the figure is a declared floor rather than a measurement. The provenance
+ * diagnostic records the same fact as `usage.input: "declared"`.
+ */
+export const KIRO_CONTEXT_OVERFLOW_DECLARED_USAGE_KEY = "contextOverflowDeclared";
 
 /**
  * Provenance for the figures pi's flat `Usage` cannot self-describe.
@@ -80,8 +103,10 @@ export const KIRO_MODELED_STOP_REASONS = {
    *
    * It arrives on a 200 with no error body, so the prose-matching
    * `isContextOverflow()` path never sees it and the turn looks like a normal
-   * completion that simply stopped early. A consumer that needs to compact has
-   * to read this field to find out.
+   * completion that simply stopped early. `streamKiro` raises `usage.input`
+   * past the window on such a turn (see
+   * {@link KIRO_CONTEXT_OVERFLOW_DECLARED_USAGE_KEY}) so pi's silent-overflow
+   * check compacts it; this field remains the statement of record.
    */
   contextWindowExceeded: "MODEL_CONTEXT_WINDOW_EXCEEDED",
   /**

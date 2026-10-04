@@ -28,6 +28,8 @@ import { applyCacheEstimate } from "./cache-estimator.js";
 import { debugEnabled, debugLog, formatSafeError, redactSensitiveText } from "./debug.js";
 import {
   createKiroTurnProvenanceDiagnostic,
+  isModeledContextOverflowStopReason,
+  KIRO_CONTEXT_OVERFLOW_DECLARED_USAGE_KEY,
   type KiroStopReasonSource,
   type KiroUsageProvenance,
 } from "./diagnostics.js";
@@ -1930,6 +1932,37 @@ function streamKiroWithUsageTracking(
           }
           const estimatedCost = estimateKiroCreditCost(usageTracking, meteringEvent);
           if (estimatedCost !== undefined) output.usage.cost.total = estimatedCost;
+        }
+        // The service declared the context window exceeded on a turn emitted as
+        // `"stop"` (#124: `"length"` would loop pi's continuation notice into the
+        // same overflow). pi compacts a successful turn only through
+        // `isContextOverflow()`'s silent-overflow case, which needs
+        // `input + cacheRead > contextWindow` strictly — unreachable here, since
+        // `input` is derived from a percentage capped at the window and the
+        // service never reports `cacheRead`. Without this the truncated answer is
+        // kept and nothing compacts. Raise `input` to the smallest value that
+        // states the overflow and mark it as declared, not measured.
+        //
+        // Runs after `calculateCost` and the cache estimate on purpose: the floor
+        // must not be priced as real input, and the estimator must not learn it
+        // as next turn's prompt size. Never touches usage for any other stop
+        // reason, nor for a tool-use turn (pi compacts only a `"stop"` here).
+        if (
+          output.stopReason === "stop" &&
+          model.contextWindow > 0 &&
+          isModeledContextOverflowStopReason(usageEvent?.rawStopReason)
+        ) {
+          const usage = output.usage;
+          if (usage.input + usage.cacheRead <= model.contextWindow) {
+            usage.input = model.contextWindow + 1 - usage.cacheRead;
+            usageProvenance.input = "declared";
+          }
+          const summed = usage.input + usage.cacheRead + usage.cacheWrite + usage.output;
+          if (usage.totalTokens < summed) {
+            usage.totalTokens = summed;
+            usageProvenance.totalTokens = "declared";
+          }
+          (usage as unknown as Record<string, unknown>)[KIRO_CONTEXT_OVERFLOW_DECLARED_USAGE_KEY] = true;
         }
         // Record where this turn's numbers came from. The usage provenance and
         // the modeled stop reason are both invisible in the emitted message: the

@@ -32,6 +32,7 @@ export type {
 export {
   createKiroTurnProvenanceDiagnostic,
   isModeledContextOverflowStopReason,
+  KIRO_CONTEXT_OVERFLOW_DECLARED_USAGE_KEY,
   KIRO_MODELED_STOP_REASONS,
   KIRO_TURN_PROVENANCE_DIAGNOSTIC,
 } from "./diagnostics.js";

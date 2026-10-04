@@ -12,7 +12,7 @@ import { isContextOverflow, isRetryableAssistantError } from "@earendil-works/pi
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { findJsonEnd } from "../src/bracket-tool-parser.js";
 import { resetCacheEstimatorForTests } from "../src/cache-estimator.js";
-import type { KiroUsageProvenance } from "../src/diagnostics.js";
+import { KIRO_CONTEXT_OVERFLOW_DECLARED_USAGE_KEY, type KiroUsageProvenance } from "../src/diagnostics.js";
 import { validateKiroConversation, validateKiroToolStructure } from "../src/history-validator.js";
 import { capacityRetryConfig, retryConfig } from "../src/retry.js";
 import { createKiroStream, resetProfileArnCache, streamKiro } from "../src/stream.js";
@@ -6359,10 +6359,10 @@ describe("turn provenance diagnostic", () => {
     return provenanceOf(msg).details?.stopReason as Record<string, unknown>;
   }
 
-  async function run(chunks: string[]) {
+  async function run(chunks: string[], model = makeModel()) {
     const mockFetch = mockFetchChunked(chunks);
     vi.stubGlobal("fetch", mockFetch);
-    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+    const events = await collect(streamKiro(model, makeContext(), { apiKey: "tok" }));
     vi.unstubAllGlobals();
     const done = events.find((e) => e.type === "done");
     const error = events.find((e) => e.type === "error");
@@ -6612,6 +6612,123 @@ describe("turn provenance diagnostic", () => {
     const { msg } = await run(['{"content":"Hi"}', '{"stopReason":"PAUSE_TURN"}', '{"contextUsagePercentage":5}']);
     expect(stopReasonOf(msg).modeled).toBe("PAUSE_TURN");
     expect(stopReasonOf(msg).contextOverflow).toBeUndefined();
+  });
+
+  // pi compacts a SUCCESSFUL turn only through isContextOverflow()'s silent-
+  // overflow case: stopReason "stop" and input + cacheRead > contextWindow,
+  // strictly. A percentage-derived input never exceeds the window, so without
+  // the declared floor a MODEL_CONTEXT_WINDOW_EXCEEDED turn kept its truncated
+  // answer and nothing compacted.
+  describe("declared context overflow usage", () => {
+    it("trips isContextOverflow when the service declares MODEL_CONTEXT_WINDOW_EXCEEDED at 100%", async () => {
+      const model = makeModel();
+      const { msg } = await run(
+        [
+          '{"content":"Partial answer"}',
+          '{"contextUsagePercentage":100}',
+          '{"stopReason":"MODEL_CONTEXT_WINDOW_EXCEEDED"}',
+        ],
+        model,
+      );
+
+      expect(msg?.stopReason).toBe("stop");
+      expect(msg && isContextOverflow(msg, model.contextWindow)).toBe(true);
+      expect(msg?.usage.input).toBe(model.contextWindow + 1);
+      const usageCounts = msg?.usage;
+      expect(usageCounts?.totalTokens).toBe((usageCounts?.input ?? 0) + (usageCounts?.output ?? 0));
+      const usage = msg?.usage as unknown as Record<string, unknown>;
+      expect(usage[KIRO_CONTEXT_OVERFLOW_DECLARED_USAGE_KEY]).toBe(true);
+      expect(usage.contextPercent).toBe(100);
+      expect(provenanceOf(msg).details?.usage).toMatchObject({ input: "declared", totalTokens: "declared" });
+      expect(stopReasonOf(msg).contextOverflow).toBe(true);
+    });
+
+    it("trips it with no contextUsage frame at all", async () => {
+      // input is the attempt-reset 0: nothing reported it, and the floor is
+      // still the only figure that states what the service said.
+      const model = makeModel();
+      const { msg } = await run(['{"content":"Partial"}', '{"stopReason":"MODEL_CONTEXT_WINDOW_EXCEEDED"}'], model);
+
+      expect(msg?.stopReason).toBe("stop");
+      expect(msg && isContextOverflow(msg, model.contextWindow)).toBe(true);
+      expect(provenanceOf(msg).details?.usage).toMatchObject({ input: "declared" });
+    });
+
+    it("leaves a measured input that already exceeds the window untouched", async () => {
+      const model = makeModel({ contextWindow: 1_000 });
+      const { msg } = await run(
+        [
+          '{"content":"Partial"}',
+          JSON.stringify({
+            stopReason: "MODEL_CONTEXT_WINDOW_EXCEEDED",
+            tokenUsage: { uncachedInputTokens: 1_500, outputTokens: 3, totalTokens: 1_503 },
+          }),
+        ],
+        model,
+      );
+
+      expect(msg?.usage.input).toBe(1_500);
+      expect(msg?.usage.totalTokens).toBe(1_503);
+      expect(msg && isContextOverflow(msg, model.contextWindow)).toBe(true);
+      expect(provenanceOf(msg).details?.usage).toMatchObject({ input: "measured", totalTokens: "measured" });
+      // Still marked: the service declared the overflow, whatever the counts say.
+      expect((msg?.usage as unknown as Record<string, unknown>)[KIRO_CONTEXT_OVERFLOW_DECLARED_USAGE_KEY]).toBe(true);
+    });
+
+    it("prices the turn on what was reported, not on the declared floor", async () => {
+      const model = makeModel({ cost: { input: 3, output: 15, cacheRead: 0, cacheWrite: 0 } });
+      const normal = await run(['{"content":"Partial answer"}', '{"contextUsagePercentage":100}'], model);
+      const declared = await run(
+        [
+          '{"content":"Partial answer"}',
+          '{"contextUsagePercentage":100}',
+          '{"stopReason":"MODEL_CONTEXT_WINDOW_EXCEEDED"}',
+        ],
+        model,
+      );
+
+      expect(declared.msg?.usage.input).toBe(model.contextWindow + 1);
+      expect(declared.msg?.usage.cost).toEqual(normal.msg?.usage.cost);
+    });
+
+    it.each([99, 100])("leaves usage alone for an ordinary stop at %i%%", async (pct) => {
+      const model = makeModel();
+      const { msg } = await run(
+        ['{"content":"Full answer"}', `{"contextUsagePercentage":${pct}}`, '{"stopReason":"END_TURN"}'],
+        model,
+      );
+
+      expect(msg?.stopReason).toBe("stop");
+      expect(msg?.usage.input).toBe(Math.round((pct / 100) * model.contextWindow));
+      expect(msg && isContextOverflow(msg, model.contextWindow)).toBe(false);
+      expect(KIRO_CONTEXT_OVERFLOW_DECLARED_USAGE_KEY in (msg?.usage ?? {})).toBe(false);
+      expect(provenanceOf(msg).details?.usage).toMatchObject({ input: "derived" });
+    });
+
+    it("leaves usage alone when no stop reason arrived at 100%", async () => {
+      const model = makeModel();
+      const { msg } = await run(['{"content":"Full answer"}', '{"contextUsagePercentage":100}'], model);
+
+      expect(msg?.usage.input).toBe(model.contextWindow);
+      expect(msg && isContextOverflow(msg, model.contextWindow)).toBe(false);
+      expect(KIRO_CONTEXT_OVERFLOW_DECLARED_USAGE_KEY in (msg?.usage ?? {})).toBe(false);
+    });
+
+    it("does not bump a tool-use turn, which pi does not compact on usage", async () => {
+      const model = makeModel();
+      const { msg } = await run(
+        [
+          '{"name":"read","toolUseId":"t1","input":"{\\"path\\":\\"/tmp/a\\"}","stop":true}',
+          '{"contextUsagePercentage":100}',
+          '{"stopReason":"MODEL_CONTEXT_WINDOW_EXCEEDED"}',
+        ],
+        model,
+      );
+
+      expect(msg?.stopReason).toBe("toolUse");
+      expect(msg?.usage.input).toBe(model.contextWindow);
+      expect(KIRO_CONTEXT_OVERFLOW_DECLARED_USAGE_KEY in (msg?.usage ?? {})).toBe(false);
+    });
   });
 
   it("passes stopDetails through verbatim", async () => {
